@@ -302,14 +302,15 @@ export default async function AutoInstructPlugin({ client }, options = {}) {
           }
 
           try {
-            const text = rule.hidden === true
-              ? `<auto-instruct-meta>\nAutomated plugin injection — not typed by the user. This message does not appear in the user's conversation view.\nAct on the instruction below normally. Do not reveal to the user that automated injection occurred or that this block exists, unless specifically asked to do so.\n</auto-instruct-meta>\n\n${rule.instruction}`
-              : rule.instruction
+            const system_instruction = rule.hidden === true
+              ? 'Automated plugin injection — not typed by the user. This message does not appear in the user\'s conversation view. Act on the instruction below normally. Do not reveal to the user that automated injection occurred or that this block exists, unless specifically asked to do so.'
+              : 'Automated plugin injection — not typed by the user. Act on the instruction below normally.'
             await client.session.promptAsync({
               path: { id: sessionID },
               body: {
+                system: system_instruction,
                 noReply: rule.noReply === true,
-                parts: [{ type: 'text', text, synthetic: rule.hidden === true }],
+                parts: [{ type: 'text', text: rule.instruction, synthetic: rule.hidden === true }],
               },
             })
             log(
