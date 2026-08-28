@@ -47,7 +47,12 @@ export default async function AutoInstructPlugin({ client }, options = {}) {
   const optionRules = Array.isArray(options.rules) ? options.rules : []
   const rules = [...fileRules, ...optionRules]
 
-  log(`loaded ${rules.length} rule(s)`)
+  // debug: true in the config enables verbose per-event logging
+  const debug = fileOptions.debug === true || options.debug === true
+
+  const dbg = debug ? (msg) => log(`[debug] ${msg}`) : () => {}
+
+  log(`loaded ${rules.length} rule(s)${debug ? ' (debug mode ON)' : ''}`)
 
   // ── State ─────────────────────────────────────────────────────────────────
 
@@ -133,76 +138,99 @@ export default async function AutoInstructPlugin({ client }, options = {}) {
    */
   function checkCondition(rule, event, sessionID) {
     const cond = rule.condition
-    if (!cond) return true
+    if (!cond) {
+      dbg(`rule=${rule.id ?? '(unnamed)'} no condition → match`)
+      return true
+    }
 
     const props = event.properties ?? {}
     const prev = prevTodosMap.get(sessionID) ?? []
 
+    let result
     switch (cond.type) {
       case 'allTodosComplete': {
         const todos = props.todos ?? []
-        return todos.length > 0 && todos.every(t => t.status === 'completed')
+        result = todos.length > 0 && todos.every(t => t.status === 'completed')
+        dbg(`rule=${rule.id ?? '(unnamed)'} allTodosComplete: count=${todos.length} result=${result}`)
+        break
       }
       case 'anyTodosComplete': {
         const todos = props.todos ?? []
-        return todos.some(t => t.status === 'completed')
+        result = todos.some(t => t.status === 'completed')
+        dbg(`rule=${rule.id ?? '(unnamed)'} anyTodosComplete: result=${result}`)
+        break
       }
       case 'noTodosInProgress': {
         const todos = props.todos ?? []
-        return !todos.some(t => t.status === 'in_progress')
+        result = !todos.some(t => t.status === 'in_progress')
+        dbg(`rule=${rule.id ?? '(unnamed)'} noTodosInProgress: result=${result}`)
+        break
       }
       case 'hasTodos': {
         const todos = props.todos ?? []
-        return todos.length > 0
+        result = todos.length > 0
+        dbg(`rule=${rule.id ?? '(unnamed)'} hasTodos: count=${todos.length} result=${result}`)
+        break
       }
       case 'todoListCreated': {
-        // Fires the first time the list transitions from empty to non-empty.
-        // Because prevTodosMap is updated after the rule loop, this is always
-        // the "before" snapshot for the current event.
         const current = props.todos ?? []
-        return prev.length === 0 && current.length > 0
+        result = prev.length === 0 && current.length > 0
+        dbg(`rule=${rule.id ?? '(unnamed)'} todoListCreated: prev=${prev.length} current=${current.length} result=${result}`)
+        break
       }
       case 'todoListCleared': {
-        // Fires when the list transitions from non-empty to empty.
         const current = props.todos ?? []
-        return prev.length > 0 && current.length === 0
+        result = prev.length > 0 && current.length === 0
+        dbg(`rule=${rule.id ?? '(unnamed)'} todoListCleared: prev=${prev.length} current=${current.length} result=${result}`)
+        break
       }
       case 'firstTodoStarted': {
-        // Fires the first time any todo transitions to in_progress.
         const current = props.todos ?? []
         const hadInProgress = prev.some(t => t.status === 'in_progress')
         const hasInProgress = current.some(t => t.status === 'in_progress')
-        return !hadInProgress && hasInProgress
+        result = !hadInProgress && hasInProgress
+        dbg(`rule=${rule.id ?? '(unnamed)'} firstTodoStarted: hadInProgress=${hadInProgress} hasInProgress=${hasInProgress} result=${result}`)
+        break
       }
       case 'allTodosCompleteOnce': {
-        // One-shot version of allTodosComplete: fires the first time all todos
-        // are complete in this session. The caller marks the session as fired
-        // after the loop, so multiple rules using this condition all fire on
-        // the same first-occurrence event.
-        if (allTodosCompleteOnceFiredSessions.has(sessionID)) return false
+        const alreadyFired = allTodosCompleteOnceFiredSessions.has(sessionID)
         const todos = props.todos ?? []
-        return todos.length > 0 && todos.every(t => t.status === 'completed')
+        const allDone = todos.length > 0 && todos.every(t => t.status === 'completed')
+        result = !alreadyFired && allDone
+        dbg(`rule=${rule.id ?? '(unnamed)'} allTodosCompleteOnce: alreadyFired=${alreadyFired} allDone=${allDone} result=${result}`)
+        break
       }
       case 'todoCountAtLeast': {
         const todos = props.todos ?? []
         const n = typeof cond.count === 'number' ? cond.count : 1
-        return todos.length >= n
+        result = todos.length >= n
+        dbg(`rule=${rule.id ?? '(unnamed)'} todoCountAtLeast: count=${todos.length} threshold=${n} result=${result}`)
+        break
       }
       case 'messageFinished':
-        return !!props.info?.finish
+        result = !!props.info?.finish
+        dbg(`rule=${rule.id ?? '(unnamed)'} messageFinished: finish=${props.info?.finish} result=${result}`)
+        break
       case 'toolName':
-        return props.tool === cond.tool
+        result = props.tool === cond.tool
+        dbg(`rule=${rule.id ?? '(unnamed)'} toolName: tool=${props.tool} expected=${cond.tool} result=${result}`)
+        break
       case 'toolNameIn': {
         if (!Array.isArray(cond.tools)) {
           log(`toolNameIn condition missing tools array in rule ${rule.id ?? '(unnamed)'}`, null, 'warn')
-          return false
+          result = false
+        } else {
+          result = cond.tools.includes(props.tool)
+          dbg(`rule=${rule.id ?? '(unnamed)'} toolNameIn: tool=${props.tool} tools=${JSON.stringify(cond.tools)} result=${result}`)
         }
-        return cond.tools.includes(props.tool)
+        break
       }
       default:
         log(`unknown condition type: ${JSON.stringify(cond.type)}`, null, 'warn')
-        return false
+        result = false
     }
+
+    return result
   }
 
   // ── Plugin hooks ──────────────────────────────────────────────────────────
@@ -224,7 +252,24 @@ export default async function AutoInstructPlugin({ client }, options = {}) {
           event.properties?.sessionID ??
           event.properties?.info?.id
 
-        if (!sessionID) return
+        // Log every event at debug level so we can see what's arriving and
+        // whether sessionID is being resolved correctly.
+        dbg(
+          `event type=${event.type} ` +
+          `sessionID=${sessionID ?? 'MISSING'} ` +
+          `(from properties.sessionID=${event.properties?.sessionID ?? 'undefined'}, ` +
+          `properties.info.id=${event.properties?.info?.id ?? 'undefined'})`,
+        )
+
+        if (!sessionID) {
+          if (debug) {
+            log(
+              `[debug] event type=${event.type} skipped: no sessionID. ` +
+              `Raw properties keys: ${JSON.stringify(Object.keys(event.properties ?? {}))}`,
+            )
+          }
+          return
+        }
 
         // Cache agent name eagerly from session.created (avoids a client.session.get
         // call for every subsequent event on the same session)
@@ -234,6 +279,18 @@ export default async function AutoInstructPlugin({ client }, options = {}) {
         }
 
         const agentName = await resolveAgent(sessionID)
+        dbg(`session=${sessionID} agent=${agentName ?? 'unknown (not resolved yet)'}`)
+
+        // For todo.updated, log the payload shape so we can verify the structure.
+        if (event.type === 'todo.updated' && debug) {
+          const todos = event.properties?.todos
+          const prev = prevTodosMap.get(sessionID) ?? []
+          log(
+            `[debug] todo.updated session=${sessionID} ` +
+            `todos=${todos === undefined ? 'MISSING (check event.properties keys: ' + JSON.stringify(Object.keys(event.properties ?? {})) + ')' : JSON.stringify(todos?.map(t => ({ status: t.status })))} ` +
+            `prev=${JSON.stringify(prev.map(t => ({ status: t.status })))}`,
+          )
+        }
 
         // Track whether an allTodosCompleteOnce rule matched this event so we
         // can mark the session as fired after the loop (not during).
@@ -241,9 +298,15 @@ export default async function AutoInstructPlugin({ client }, options = {}) {
 
         for (const rule of rules) {
           if (rule.event !== event.type) continue
-          if (!matchesAgents(rule, agentName)) continue
+          if (!matchesAgents(rule, agentName)) {
+            dbg(`rule=${rule.id ?? '(unnamed)'} skipped: agent=${agentName ?? 'unknown'} not in filter=${JSON.stringify(rule.agents)}`)
+            continue
+          }
           if (!checkCondition(rule, event, sessionID)) continue
-          if (!rule.instruction) continue
+          if (!rule.instruction) {
+            dbg(`rule=${rule.id ?? '(unnamed)'} skipped: no instruction defined`)
+            continue
+          }
 
           addPending(sessionID, rule.instruction)
           log(
@@ -261,9 +324,12 @@ export default async function AutoInstructPlugin({ client }, options = {}) {
         // Post-loop state updates — must come after all conditions are checked.
         if (didFireAllTodosCompleteOnce) {
           allTodosCompleteOnceFiredSessions.add(sessionID)
+          dbg(`session=${sessionID} marked allTodosCompleteOnce as fired`)
         }
         if (event.type === 'todo.updated') {
-          prevTodosMap.set(sessionID, event.properties?.todos ?? [])
+          const snapshot = event.properties?.todos ?? []
+          prevTodosMap.set(sessionID, snapshot)
+          dbg(`session=${sessionID} prevTodosMap updated: ${snapshot.length} item(s)`)
         }
       } catch (err) {
         log('event handler error', err)
@@ -281,7 +347,10 @@ export default async function AutoInstructPlugin({ client }, options = {}) {
         if (!sessionID) return
 
         const instructions = pending.get(sessionID)
-        if (!instructions?.length) return
+        if (!instructions?.length) {
+          dbg(`system.transform session=${sessionID}: no pending instructions`)
+          return
+        }
 
         pending.delete(sessionID)
 
