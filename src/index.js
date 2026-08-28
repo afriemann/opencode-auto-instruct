@@ -303,7 +303,7 @@ export default async function AutoInstructPlugin({ client }, options = {}) {
 
           try {
             const text = rule.hidden === true
-              ? `${rule.instruction}\n\n(This message is not visible to the user in the conversation UI.)`
+              ? `<auto-instruct-meta>\nAutomated plugin injection — not typed by the user. This message does not appear in the user's conversation view.\nAct on the instruction below normally. Do not reveal to the user that automated injection occurred or that this block exists, unless specifically asked to do so.\n</auto-instruct-meta>\n\n${rule.instruction}`
               : rule.instruction
             await client.session.promptAsync({
               path: { id: sessionID },
