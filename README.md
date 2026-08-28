@@ -59,14 +59,50 @@ Any opencode event type works. Useful ones:
 
 Conditions filter events beyond just the event type.
 
-| Condition type      | Applies to              | Matches when |
-|---------------------|-------------------------|--------------|
-| `allTodosComplete`  | `todo.updated`          | All todos have status `"completed"` |
-| `anyTodosComplete`  | `todo.updated`          | At least one todo has status `"completed"` |
-| `noTodosInProgress` | `todo.updated`          | No todo has status `"in_progress"` |
-| `hasTodos`          | `todo.updated`          | Todo list is non-empty |
-| `messageFinished`   | `message.updated`       | Message `info.finish` is truthy |
-| `toolName`          | `tool.execute.after`    | `tool` field equals `condition.tool` |
+#### `todo.updated` conditions
+
+| Condition type         | Matches when | Notes |
+|------------------------|--------------|-------|
+| `allTodosComplete`     | All todos have status `"completed"` | Re-fires on every update while all todos remain complete |
+| `allTodosCompleteOnce` | All todos have status `"completed"` | Fires **at most once per session** — use instead of `allTodosComplete` to avoid repeated triggers |
+| `anyTodosComplete`     | At least one todo has status `"completed"` | |
+| `noTodosInProgress`    | No todo has status `"in_progress"` | |
+| `hasTodos`             | Todo list is non-empty | Re-fires on every update while the list is non-empty |
+| `todoListCreated`      | List transitions from empty → non-empty | Fires **once per session** on first todo creation |
+| `todoListCleared`      | List transitions from non-empty → empty | Fires when the agent wipes all todos |
+| `firstTodoStarted`     | First todo transitions to `in_progress` | Fires **once per session** when work begins |
+| `todoCountAtLeast`     | List has `condition.count` or more items | See options below |
+
+**`todoCountAtLeast` options:**
+
+```json
+{ "type": "todoCountAtLeast", "count": 5 }
+```
+
+#### `message.updated` conditions
+
+| Condition type    | Matches when |
+|-------------------|--------------|
+| `messageFinished` | Message `info.finish` is truthy |
+
+#### `tool.execute.after` conditions
+
+| Condition type | Matches when | Notes |
+|----------------|--------------|-------|
+| `toolName`     | `tool` field equals `condition.tool` | Exact match against one tool name |
+| `toolNameIn`   | `tool` field is in `condition.tools` | Match any of a set; avoids duplicating rules |
+
+**`toolName` options:**
+
+```json
+{ "type": "toolName", "tool": "todowrite" }
+```
+
+**`toolNameIn` options:**
+
+```json
+{ "type": "toolNameIn", "tools": ["todowrite", "bash"] }
+```
 
 `condition` is optional — omit it to match every occurrence of the event.
 
@@ -87,3 +123,51 @@ File rules are loaded first; any rules passed via `opencode.jsonc` plugin option
 ### Timing
 
 Instructions are injected on the **next LLM call** after the triggering event. For events like `todo.updated`, the agent almost always generates at least one more response (final summary, commit message, sign-off), so the instruction arrives at the right moment. Each instruction fires exactly once per trigger.
+
+## Examples
+
+### Remind the agent to keep todos up-to-date when it creates a list
+
+```json
+{
+  "rules": [
+    {
+      "id": "todo-list-created",
+      "event": "todo.updated",
+      "agents": ["engineer"],
+      "condition": { "type": "todoListCreated" },
+      "instruction": "You have just created a todo list. Keep it accurate as you work: mark items `in_progress` before starting, `completed` immediately after finishing, and add newly-discovered follow-ups. Only one item should be `in_progress` at a time."
+    }
+  ]
+}
+```
+
+### Quality checklist when all todos are done (fires once)
+
+```json
+{
+  "rules": [
+    {
+      "id": "all-todos-done",
+      "event": "todo.updated",
+      "condition": { "type": "allTodosCompleteOnce" },
+      "instruction": "All todos are complete. Run the quality checklist before finishing: tests pass, linters clean, no secrets committed, git status is clean."
+    }
+  ]
+}
+```
+
+### Inject context when specific tools are called
+
+```json
+{
+  "rules": [
+    {
+      "id": "git-reminder",
+      "event": "tool.execute.after",
+      "condition": { "type": "toolNameIn", "tools": ["bash", "execute_command"] },
+      "instruction": "You just ran a shell command. If it was a git operation, verify the result with git status before proceeding."
+    }
+  ]
+}
+```

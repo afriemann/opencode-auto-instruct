@@ -57,6 +57,21 @@ export default async function AutoInstructPlugin({ client }, options = {}) {
   /** sessionID → string[] of pending instructions to inject on next LLM call */
   const pending = new Map()
 
+  /**
+   * sessionID → todos[] snapshot from the last todo.updated event.
+   * Used by transition-detecting conditions (todoListCreated, todoListCleared,
+   * firstTodoStarted) to compare current state against the previous state.
+   * Updated AFTER all rules are evaluated for a todo.updated event, so every
+   * condition sees the same consistent prev/current pair within one event.
+   */
+  const prevTodosMap = new Map()
+
+  /**
+   * Set of sessionIDs where allTodosCompleteOnce has already fired.
+   * Populated after the rule loop so all matching rules see the unfired state.
+   */
+  const allTodosCompleteOnceFiredSessions = new Set()
+
   // ── Helpers ───────────────────────────────────────────────────────────────
 
   function addPending(sessionID, instruction) {
@@ -95,19 +110,33 @@ export default async function AutoInstructPlugin({ client }, options = {}) {
    * Evaluates the optional condition on the event.
    * Returns true when there is no condition (unconditional rule).
    *
+   * Transition-detecting conditions (todoListCreated, todoListCleared,
+   * firstTodoStarted) read prevTodosMap but never write to it — the caller
+   * updates that map after all rules have been evaluated.
+   *
+   * allTodosCompleteOnce reads allTodosCompleteOnceFiredSessions but never
+   * writes to it — the caller marks the session after the loop.
+   *
    * Supported condition types:
-   *   allTodosComplete   — every todo has status "completed"
-   *   anyTodosComplete   — at least one todo has status "completed"
-   *   noTodosInProgress  — no todo has status "in_progress"
-   *   hasTodos           — todo list is non-empty
-   *   messageFinished    — message.updated with info.finish truthy
-   *   toolName           — tool.execute.after where tool matches condition.tool
+   *   allTodosComplete      — every todo has status "completed"
+   *   anyTodosComplete      — at least one todo has status "completed"
+   *   noTodosInProgress     — no todo has status "in_progress"
+   *   hasTodos              — todo list is non-empty
+   *   todoListCreated       — first todo.updated where list transitions from empty to non-empty
+   *   todoListCleared       — todo.updated where list transitions from non-empty to empty
+   *   firstTodoStarted      — first todo.updated where an item transitions to in_progress
+   *   allTodosCompleteOnce  — like allTodosComplete, but fires at most once per session
+   *   todoCountAtLeast      — list has at least condition.count items
+   *   messageFinished       — message.updated with info.finish truthy
+   *   toolName              — tool.execute.after where tool matches condition.tool
+   *   toolNameIn            — tool.execute.after where tool is in condition.tools array
    */
-  function checkCondition(rule, event) {
+  function checkCondition(rule, event, sessionID) {
     const cond = rule.condition
     if (!cond) return true
 
     const props = event.properties ?? {}
+    const prev = prevTodosMap.get(sessionID) ?? []
 
     switch (cond.type) {
       case 'allTodosComplete': {
@@ -126,10 +155,50 @@ export default async function AutoInstructPlugin({ client }, options = {}) {
         const todos = props.todos ?? []
         return todos.length > 0
       }
+      case 'todoListCreated': {
+        // Fires the first time the list transitions from empty to non-empty.
+        // Because prevTodosMap is updated after the rule loop, this is always
+        // the "before" snapshot for the current event.
+        const current = props.todos ?? []
+        return prev.length === 0 && current.length > 0
+      }
+      case 'todoListCleared': {
+        // Fires when the list transitions from non-empty to empty.
+        const current = props.todos ?? []
+        return prev.length > 0 && current.length === 0
+      }
+      case 'firstTodoStarted': {
+        // Fires the first time any todo transitions to in_progress.
+        const current = props.todos ?? []
+        const hadInProgress = prev.some(t => t.status === 'in_progress')
+        const hasInProgress = current.some(t => t.status === 'in_progress')
+        return !hadInProgress && hasInProgress
+      }
+      case 'allTodosCompleteOnce': {
+        // One-shot version of allTodosComplete: fires the first time all todos
+        // are complete in this session. The caller marks the session as fired
+        // after the loop, so multiple rules using this condition all fire on
+        // the same first-occurrence event.
+        if (allTodosCompleteOnceFiredSessions.has(sessionID)) return false
+        const todos = props.todos ?? []
+        return todos.length > 0 && todos.every(t => t.status === 'completed')
+      }
+      case 'todoCountAtLeast': {
+        const todos = props.todos ?? []
+        const n = typeof cond.count === 'number' ? cond.count : 1
+        return todos.length >= n
+      }
       case 'messageFinished':
         return !!props.info?.finish
       case 'toolName':
         return props.tool === cond.tool
+      case 'toolNameIn': {
+        if (!Array.isArray(cond.tools)) {
+          log(`toolNameIn condition missing tools array in rule ${rule.id ?? '(unnamed)'}`, null, 'warn')
+          return false
+        }
+        return cond.tools.includes(props.tool)
+      }
       default:
         log(`unknown condition type: ${JSON.stringify(cond.type)}`, null, 'warn')
         return false
@@ -142,6 +211,11 @@ export default async function AutoInstructPlugin({ client }, options = {}) {
     /**
      * Listen to all events. When a rule matches, queue its instruction for
      * injection into the next LLM call for that session.
+     *
+     * State updates (prevTodosMap, allTodosCompleteOnceFiredSessions) happen
+     * AFTER the rule loop so all conditions within one event see a consistent
+     * snapshot — avoids the ordering problem where the first rule's check
+     * would change state seen by the second rule.
      */
     event: async ({ event }) => {
       try {
@@ -161,10 +235,14 @@ export default async function AutoInstructPlugin({ client }, options = {}) {
 
         const agentName = await resolveAgent(sessionID)
 
+        // Track whether an allTodosCompleteOnce rule matched this event so we
+        // can mark the session as fired after the loop (not during).
+        let didFireAllTodosCompleteOnce = false
+
         for (const rule of rules) {
           if (rule.event !== event.type) continue
           if (!matchesAgents(rule, agentName)) continue
-          if (!checkCondition(rule, event)) continue
+          if (!checkCondition(rule, event, sessionID)) continue
           if (!rule.instruction) continue
 
           addPending(sessionID, rule.instruction)
@@ -174,6 +252,18 @@ export default async function AutoInstructPlugin({ client }, options = {}) {
             `event=${event.type} ` +
             `rule=${rule.id ?? '(unnamed)'}`,
           )
+
+          if (rule.condition?.type === 'allTodosCompleteOnce') {
+            didFireAllTodosCompleteOnce = true
+          }
+        }
+
+        // Post-loop state updates — must come after all conditions are checked.
+        if (didFireAllTodosCompleteOnce) {
+          allTodosCompleteOnceFiredSessions.add(sessionID)
+        }
+        if (event.type === 'todo.updated') {
+          prevTodosMap.set(sessionID, event.properties?.todos ?? [])
         }
       } catch (err) {
         log('event handler error', err)
