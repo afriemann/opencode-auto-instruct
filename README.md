@@ -42,6 +42,7 @@ Create `~/.config/opencode/auto-instruct.json`:
 | `condition`   | `{ type, ...opts }`       | no       | Additional condition on the event. Absent = always match |
 | `instruction` | `string`                  | **yes**  | Text sent as a new conversation message to the agent |
 | `hidden`      | `boolean`                 | no       | When `true`, the instruction text is sent to the agent only — hidden from the user in the UI (default: `false`) |
+| `noReply`     | `boolean`                 | no       | When `true`, the instruction is injected without triggering an agent response turn (default: `false`) |
 
 ### Supported events
 
