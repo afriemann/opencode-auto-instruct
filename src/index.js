@@ -302,11 +302,14 @@ export default async function AutoInstructPlugin({ client }, options = {}) {
           }
 
           try {
+            const text = rule.hidden === true
+              ? `${rule.instruction}\n\n(This message is not visible to the user in the conversation UI.)`
+              : rule.instruction
             await client.session.promptAsync({
               path: { id: sessionID },
               body: {
                 noReply: rule.noReply === true,
-                parts: [{ type: 'text', text: rule.instruction, synthetic: rule.hidden === true }],
+                parts: [{ type: 'text', text, synthetic: rule.hidden === true }],
               },
             })
             log(
