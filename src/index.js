@@ -304,7 +304,7 @@ export default async function AutoInstructPlugin({ client }, options = {}) {
           try {
             await client.session.promptAsync({
               path: { id: sessionID },
-              body: { parts: [{ type: 'text', text: rule.instruction }] },
+              body: { parts: [{ type: 'text', text: rule.instruction, synthetic: rule.hidden === true }] },
             })
             log(
               `sent instruction for session=${sessionID} ` +
