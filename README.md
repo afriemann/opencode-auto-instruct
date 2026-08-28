@@ -1,6 +1,6 @@
 # opencode-auto-instruct
 
-opencode plugin that injects configurable instructions into agent sessions when events occur. Instructions are hidden from the user (injected into the system prompt) but visible to the agent on its next LLM call after the triggering event.
+opencode plugin that sends configurable instructions as real conversation messages when events occur in an agent session. Instructions appear as visible turns that the agent responds to explicitly.
 
 ## Install
 
@@ -40,7 +40,7 @@ Create `~/.config/opencode/auto-instruct.json`:
 | `event`       | `string`                  | **yes**  | opencode event type to listen on |
 | `agents`      | `string \| string[]`      | no       | Agent name(s) to match, or `"*"`. Absent = match all agents |
 | `condition`   | `{ type, ...opts }`       | no       | Additional condition on the event. Absent = always match |
-| `instruction` | `string`                  | **yes**  | Text injected into the system prompt |
+| `instruction` | `string`                  | **yes**  | Text sent as a new conversation message to the agent |
 
 ### Supported events
 

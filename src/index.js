@@ -1,9 +1,9 @@
 /**
  * opencode-auto-instruct
  *
- * Injects configurable instructions into agent sessions when events occur.
- * Instructions are hidden from the user (injected via system.transform) but
- * visible to the agent on its next LLM call after the triggering event.
+ * Sends configurable instructions as real conversation messages when events
+ * occur in an agent session. Instructions are delivered via the session prompt
+ * API so they appear as visible turns that the agent responds to explicitly.
  *
  * Config file: ~/.config/opencode/auto-instruct.json
  * See README.md for the full config schema.
@@ -59,9 +59,6 @@ export default async function AutoInstructPlugin({ client }, options = {}) {
   /** sessionID → agent name (populated from session.created and lazy-fetched) */
   const sessionAgents = new Map()
 
-  /** sessionID → string[] of pending instructions to inject on next LLM call */
-  const pending = new Map()
-
   /**
    * sessionID → todos[] snapshot from the last todo.updated event.
    * Used by transition-detecting conditions (todoListCreated, todoListCleared,
@@ -78,11 +75,6 @@ export default async function AutoInstructPlugin({ client }, options = {}) {
   const allTodosCompleteOnceFiredSessions = new Set()
 
   // ── Helpers ───────────────────────────────────────────────────────────────
-
-  function addPending(sessionID, instruction) {
-    if (!pending.has(sessionID)) pending.set(sessionID, [])
-    pending.get(sessionID).push(instruction)
-  }
 
   async function resolveAgent(sessionID) {
     if (sessionAgents.has(sessionID)) return sessionAgents.get(sessionID)
@@ -237,8 +229,9 @@ export default async function AutoInstructPlugin({ client }, options = {}) {
 
   return {
     /**
-     * Listen to all events. When a rule matches, queue its instruction for
-     * injection into the next LLM call for that session.
+     * Listen to all events. When a rule matches, send its instruction as a
+     * new session message via client.session.promptAsync so the agent sees
+     * and responds to it as a visible conversation turn.
      *
      * State updates (prevTodosMap, allTodosCompleteOnceFiredSessions) happen
      * AFTER the rule loop so all conditions within one event see a consistent
@@ -308,13 +301,24 @@ export default async function AutoInstructPlugin({ client }, options = {}) {
             continue
           }
 
-          addPending(sessionID, rule.instruction)
-          log(
-            `queued instruction for session=${sessionID} ` +
-            `agent=${agentName ?? 'unknown'} ` +
-            `event=${event.type} ` +
-            `rule=${rule.id ?? '(unnamed)'}`,
-          )
+          try {
+            await client.session.promptAsync({
+              path: { id: sessionID },
+              body: { parts: [{ type: 'text', text: rule.instruction }] },
+            })
+            log(
+              `sent instruction for session=${sessionID} ` +
+              `agent=${agentName ?? 'unknown'} ` +
+              `event=${event.type} ` +
+              `rule=${rule.id ?? '(unnamed)'}`,
+            )
+          } catch (err) {
+            log(
+              `failed to send instruction for session=${sessionID} ` +
+              `rule=${rule.id ?? '(unnamed)'}`,
+              err,
+            )
+          }
 
           if (rule.condition?.type === 'allTodosCompleteOnce') {
             didFireAllTodosCompleteOnce = true
@@ -333,34 +337,6 @@ export default async function AutoInstructPlugin({ client }, options = {}) {
         }
       } catch (err) {
         log('event handler error', err)
-      }
-    },
-
-    /**
-     * On every LLM call, check whether there are pending instructions for
-     * this session and inject them into the system prompt. Instructions are
-     * consumed immediately so they fire exactly once per trigger.
-     */
-    'experimental.chat.system.transform': async (input, output) => {
-      try {
-        const sessionID = input?.sessionID
-        if (!sessionID) return
-
-        const instructions = pending.get(sessionID)
-        if (!instructions?.length) {
-          dbg(`system.transform session=${sessionID}: no pending instructions`)
-          return
-        }
-
-        pending.delete(sessionID)
-
-        for (const instruction of instructions) {
-          output.system.push(instruction)
-        }
-
-        log(`injected ${instructions.length} instruction(s) for session ${sessionID}`)
-      } catch (err) {
-        log('system.transform error', err)
       }
     },
   }
