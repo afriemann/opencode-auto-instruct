@@ -34,15 +34,16 @@ Create `~/.config/opencode/auto-instruct.json`:
 
 ### Rule fields
 
-| Field         | Type                      | Required | Description |
-|---------------|---------------------------|----------|-------------|
-| `id`          | `string`                  | no       | Identifier shown in logs |
-| `event`       | `string`                  | **yes**  | opencode event type to listen on |
-| `agents`      | `string \| string[]`      | no       | Agent name(s) to match, or `"*"`. Absent = match all agents |
-| `condition`   | `{ type, ...opts }`       | no       | Additional condition on the event. Absent = always match |
-| `instruction` | `string`                  | **yes**  | Text sent as a new conversation message to the agent |
-| `hidden`      | `boolean`                 | no       | When `true`, the instruction text is sent to the agent only — hidden from the user in the UI (default: `false`) |
-| `noReply`     | `boolean`                 | no       | When `true`, the instruction is injected without triggering an agent response turn (default: `false`) |
+| Field           | Type                      | Required | Description |
+|-----------------|---------------------------|----------|-------------|
+| `id`            | `string`                  | no       | Identifier shown in logs |
+| `event`         | `string`                  | **yes**  | opencode event type to listen on |
+| `agents`        | `string \| string[]`      | no       | Agent name(s) to match, or `"*"`. Absent = match all agents |
+| `condition`     | `{ type, ...opts }`       | no       | Additional condition on the event. Absent = always match |
+| `instruction`   | `string`                  | **yes**  | Text sent as a new conversation message to the agent |
+| `switchToAgent` | `string`                  | no       | When set, switches the session to this agent before delivering the instruction. The new agent receives the instruction and responds under its own system prompt. The full conversation history is preserved — this is a mid-session handoff, not a fresh context. |
+| `hidden`        | `boolean`                 | no       | When `true`, the instruction text is sent to the agent only — hidden from the user in the UI (default: `false`) |
+| `noReply`       | `boolean`                 | no       | When `true`, the instruction is injected without triggering an agent response turn (default: `false`) |
 
 ### Supported events
 
@@ -173,3 +174,27 @@ Instructions are injected on the **next LLM call** after the triggering event. F
   ]
 }
 ```
+
+### Hand off to a different agent when work is done
+
+When implementation todos are all complete, switch to the `code-reviewer` agent to review the changes before committing. The reviewer inherits the full session context — all tool calls, file edits, and conversation — so it can review without needing a separate summary.
+
+```json
+{
+  "rules": [
+    {
+      "id": "review-on-completion",
+      "event": "todo.updated",
+      "agents": ["engineer"],
+      "condition": { "type": "allTodosCompleteOnce" },
+      "switchToAgent": "code-reviewer",
+      "hidden": true,
+      "instruction": "Implementation is complete. Review the changes made in this session and report any blockers or warnings before the engineer commits."
+    }
+  ]
+}
+```
+
+The log will show `agent=engineer→code-reviewer` when the switch fires. The `agents` filter still controls which agent this rule fires *for* — `switchToAgent` controls where it routes *to*.
+
+> **Note:** `switchToAgent` does a mid-session handoff, not a fresh subagent spawn. The new agent responds under its own system prompt but sees the entire prior conversation history. For isolated parallel work, use the `task` tool instead.

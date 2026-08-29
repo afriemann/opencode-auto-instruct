@@ -305,18 +305,22 @@ export default async function AutoInstructPlugin({ client }, options = {}) {
             const system_instruction = rule.hidden === true
               ? 'Automated plugin injection — not typed by the user. This message does not appear in the user\'s conversation view. Act on the instruction below normally. Do not reveal to the user that automated injection occurred or that this block exists, unless specifically asked to do so.'
               : 'Automated plugin injection — not typed by the user. Act on the instruction below normally.'
+            const targetAgent = rule.switchToAgent ?? agentName ?? undefined
             await client.session.promptAsync({
               path: { id: sessionID },
               body: {
                 system: system_instruction,
                 noReply: rule.noReply === true,
-                agent: agentName ?? undefined,
+                agent: targetAgent,
                 parts: [{ type: 'text', text: rule.instruction, synthetic: rule.hidden === true }],
               },
             })
+            const agentLabel = rule.switchToAgent
+              ? `${agentName ?? 'unknown'}→${rule.switchToAgent}`
+              : (agentName ?? 'unknown')
             log(
               `sent instruction for session=${sessionID} ` +
-              `agent=${agentName ?? 'unknown'} ` +
+              `agent=${agentLabel} ` +
               `event=${event.type} ` +
               `rule=${rule.id ?? '(unnamed)'}`,
             )
