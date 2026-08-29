@@ -310,6 +310,7 @@ export default async function AutoInstructPlugin({ client }, options = {}) {
               body: {
                 system: system_instruction,
                 noReply: rule.noReply === true,
+                agent: agentName ?? undefined,
                 parts: [{ type: 'text', text: rule.instruction, synthetic: rule.hidden === true }],
               },
             })
