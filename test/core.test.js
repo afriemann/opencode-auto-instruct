@@ -1,5 +1,5 @@
 // spec: openspec/specs/rule-based-instruction-injection/spec.md
-import { describe, it, mock } from 'node:test'
+import { describe, it } from 'node:test'
 import assert from 'node:assert/strict'
 import { writeFile, mkdtemp, rm } from 'node:fs/promises'
 import { tmpdir } from 'node:os'

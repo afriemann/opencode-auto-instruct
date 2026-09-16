@@ -305,6 +305,28 @@ describe('V2 adapter conformance', () => {
     }
   })
 
+  it('messageFinished does not match an errored session.step.ended (D3)', async () => {
+    const { pluginCleanup, syntheticCalls, emitEvent, cleanup } = await loadV2([
+      { id: 'r1', event: 'message.updated', condition: { type: 'messageFinished' }, instruction: 'do X' },
+    ])
+    try {
+      emitEvent({ type: 'session.step.ended', data: { sessionID: 's1', finish: 'error' } })
+      await new Promise((r) => setImmediate(r))
+      assert.equal(syntheticCalls.length, 0, 'an error finish must not match messageFinished')
+
+      emitEvent({ type: 'session.step.ended', data: { sessionID: 's1', finish: 'failure' } })
+      await new Promise((r) => setImmediate(r))
+      assert.equal(syntheticCalls.length, 0, 'a failure finish must not match messageFinished')
+
+      emitEvent({ type: 'session.step.ended', data: { sessionID: 's1', finish: 'stop' } })
+      await new Promise((r) => setImmediate(r))
+      assert.equal(syntheticCalls.length, 1, 'a successful finish must match')
+    } finally {
+      await pluginCleanup()
+      await cleanup()
+    }
+  })
+
   it('events with no resolvable session ID evaluate no rules', async () => {
     const { pluginCleanup, syntheticCalls, emitEvent, cleanup } = await loadV2([
       { id: 'r1', event: 'session.created', instruction: 'do X' },

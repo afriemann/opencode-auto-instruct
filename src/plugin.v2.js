@@ -40,6 +40,7 @@ import {
   evaluate,
   buildFraming,
   V2_UNSUPPORTED_CONDITION_TYPES,
+  V2_UNSUPPORTED_EVENT_TYPES,
 } from './core.js'
 
 const PLUGIN_NAME = 'opencode-auto-instruct'
@@ -113,7 +114,12 @@ export default Plugin.define({
     log(`loaded ${rules.length} rule(s)${debug ? ' (debug mode ON)' : ''}`)
 
     // design.md D3(a): warn once per rule at load time for any condition
-    // type with no V2 event source, rather than silently never firing.
+    // type -- OR any trigger event type -- with no V2 event source, rather
+    // than silently never firing. A rule with no condition (or an
+    // unrelated one) bound to an unsupported event is just as dead as one
+    // with an unsupported condition type, and was the specific "loads
+    // cleanly, logs nothing, never fires" failure mode design.md section 2
+    // calls out as the worst outcome available.
     for (const rule of rules) {
       const condType = rule.condition?.type
       if (condType && V2_UNSUPPORTED_CONDITION_TYPES.has(condType)) {
@@ -121,6 +127,12 @@ export default Plugin.define({
           `rule=${rule.id ?? '(unnamed)'} uses condition type "${condType}", which has no V2 event ` +
           `source as of @opencode/cli 2.0.4 (no todo domain, no tool-name-carrying event) -- ` +
           `this rule will never match on this runtime`,
+          null, 'warn',
+        )
+      } else if (V2_UNSUPPORTED_EVENT_TYPES.has(rule.event)) {
+        log(
+          `rule=${rule.id ?? '(unnamed)'} targets event "${rule.event}", which has no V2 event ` +
+          `source as of @opencode/cli 2.0.4 -- this rule will never match on this runtime`,
           null, 'warn',
         )
       }
@@ -164,15 +176,21 @@ export default Plugin.define({
             const sessionState = getSessionState(nev.sessionID)
             const decisions = evaluate(rules, nev, agentName, sessionState, log, debug)
 
-            for (const { rule, agentName: resolvedAgentName, targetAgent } of decisions) {
+            for (const { rule, agentName: resolvedAgentName } of decisions) {
               try {
-                if (rule.switchToAgent && rule.switchToAgent !== resolvedAgentName) {
+                // Re-read the live agent cache, not the stale per-event
+                // resolvedAgentName -- if an earlier rule in this same
+                // decisions loop already switched the agent, a later rule
+                // targeting the same agent must not redundantly call
+                // switchAgent again or double-log the persistence warning.
+                const currentAgent = sessionAgents.get(nev.sessionID) ?? resolvedAgentName
+                if (rule.switchToAgent && rule.switchToAgent !== currentAgent) {
                   await ctx.session.switchAgent({ sessionID: nev.sessionID, agent: rule.switchToAgent })
                   const loggedRules = switchAgentLoggedFor.get(nev.sessionID) ?? new Set()
                   if (!loggedRules.has(rule.id)) {
                     log(
                       `rule=${rule.id ?? '(unnamed)'} persistently switched session=${nev.sessionID} ` +
-                      `from agent=${resolvedAgentName ?? 'unknown'} to agent=${rule.switchToAgent} -- ` +
+                      `from agent=${currentAgent ?? 'unknown'} to agent=${rule.switchToAgent} -- ` +
                       `this is a session-level change on V2, not scoped to this one delivery`,
                       null, 'warn',
                     )

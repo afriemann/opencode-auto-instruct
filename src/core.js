@@ -96,6 +96,16 @@ export const V2_UNSUPPORTED_CONDITION_TYPES = new Set([
 ])
 
 /**
+ * V1 trigger event types with no V2 event source at all (design.md D3(a)).
+ * A rule bound to one of these events -- even with no condition, or one
+ * unrelated to V2_UNSUPPORTED_CONDITION_TYPES -- can never match on V2,
+ * since normalize() in plugin.v2.js never produces this `kind`. Exported
+ * so plugin.v2.js can warn once per rule at load time for this case too,
+ * not just the condition-type case.
+ */
+export const V2_UNSUPPORTED_EVENT_TYPES = new Set(['todo.updated', 'tool.execute.after'])
+
+/**
  * @typedef {{ kind: string, raw: any, sessionID: string|null, agentHint: string|null, todos: Array<{status:string}>|null, toolName: string|null, finish: string|null }} NormalizedEvent
  */
 
