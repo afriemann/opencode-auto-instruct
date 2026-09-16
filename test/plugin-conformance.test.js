@@ -100,6 +100,24 @@ function makeFakeV2Ctx({ sessionAgent = 'build' } = {}) {
   }
 }
 
+// Captures every process.stderr.write call for the duration of a callback
+// (V2's makeLogger() is stderr-only -- there's no injected logger to spy on
+// directly), then restores the original write. Returns the captured lines.
+async function captureStderr(fn) {
+  const original = process.stderr.write.bind(process.stderr)
+  const lines = []
+  process.stderr.write = (chunk) => {
+    lines.push(String(chunk))
+    return true
+  }
+  try {
+    await fn()
+  } finally {
+    process.stderr.write = original
+  }
+  return lines
+}
+
 async function loadV2(rules, ctxOverrides = {}) {
   const cleanup = await withConfigFile(rules)
   try {
@@ -289,19 +307,108 @@ describe('V2 adapter conformance', () => {
     }
   })
 
+  it('a second rule targeting the same agent an earlier rule already switched to does not re-switch', async () => {
+    // Regression test: the decisions loop must re-read the live per-session
+    // agent (sessionAgents cache), not the stale per-event resolvedAgentName,
+    // so that rule 2 (also targeting "review") sees rule 1's switch and skips.
+    const { pluginCleanup, switchAgentCalls, syntheticCalls, emitEvent, cleanup } = await loadV2([
+      { id: 'r1', event: 'session.created', instruction: 'do X', switchToAgent: 'review' },
+      { id: 'r2', event: 'session.created', instruction: 'do Y', switchToAgent: 'review' },
+    ], { sessionAgent: 'build' })
+    try {
+      emitEvent({ type: 'session.created', data: { sessionID: 's1', agent: 'build' } })
+      await new Promise((r) => setImmediate(r))
+      assert.equal(switchAgentCalls.length, 1, 'only rule 1 should trigger a real switchAgent call')
+      assert.equal(switchAgentCalls[0].agent, 'review')
+      assert.equal(syntheticCalls.length, 2, 'both rules must still deliver their instruction')
+    } finally {
+      await pluginCleanup()
+      await cleanup()
+    }
+  })
+
   it('todo-derived and tool-derived conditions never match on V2 (D3(a))', async () => {
     const { pluginCleanup, syntheticCalls, emitEvent, cleanup } = await loadV2([
       { id: 'r1', event: 'todo.updated', condition: { type: 'allTodosComplete' }, instruction: 'do X' },
     ])
     try {
-      // No V2 event maps to kind: 'todo.updated' at all (D3(a)), so even
-      // emitting an unrelated event must never trigger this rule.
+      // This asserts the rule's normalized `kind` can never be produced on
+      // V2 at all (D3(a)'s premise), not that a matching-shaped event was
+      // rejected -- there is no V2 event that could plausibly emit a
+      // 'todo.updated'-shaped NormalizedEvent to test against, so an
+      // unrelated event is emitted as the only available negative case.
       emitEvent({ type: 'session.created', data: { sessionID: 's1', agent: 'build' } })
       await new Promise((r) => setImmediate(r))
       assert.equal(syntheticCalls.length, 0)
     } finally {
       await pluginCleanup()
       await cleanup()
+    }
+  })
+
+  it('warns once at load time for a rule with an unsupported condition type', async () => {
+    let result
+    const lines = await captureStderr(async () => {
+      result = await loadV2([
+        { id: 'r1', event: 'session.created', condition: { type: 'allTodosComplete' }, instruction: 'do X' },
+      ])
+    })
+    try {
+      const warnLines = lines.filter((l) => l.includes('[warn]'))
+      assert.equal(warnLines.length, 1, `expected exactly one warn line, got: ${JSON.stringify(lines)}`)
+      assert.match(warnLines[0], /condition type "allTodosComplete"/)
+    } finally {
+      await result.pluginCleanup()
+      await result.cleanup()
+    }
+  })
+
+  it('warns once at load time for a rule bound to an unsupported trigger event', async () => {
+    let result
+    const lines = await captureStderr(async () => {
+      result = await loadV2([
+        { id: 'r1', event: 'todo.updated', instruction: 'do X' },
+      ])
+    })
+    try {
+      const warnLines = lines.filter((l) => l.includes('[warn]'))
+      assert.equal(warnLines.length, 1, `expected exactly one warn line, got: ${JSON.stringify(lines)}`)
+      assert.match(warnLines[0], /event "todo\.updated"/)
+    } finally {
+      await result.pluginCleanup()
+      await result.cleanup()
+    }
+  })
+
+  it('warns exactly once (not twice) when both an unsupported condition type and an unsupported event apply', async () => {
+    let result
+    const lines = await captureStderr(async () => {
+      result = await loadV2([
+        { id: 'r1', event: 'tool.execute.after', condition: { type: 'toolName', tool: 'bash' }, instruction: 'do X' },
+      ])
+    })
+    try {
+      const warnLines = lines.filter((l) => l.includes('[warn]'))
+      assert.equal(warnLines.length, 1, `expected exactly one warn line (branches must be mutually exclusive), got: ${JSON.stringify(lines)}`)
+    } finally {
+      await result.pluginCleanup()
+      await result.cleanup()
+    }
+  })
+
+  it('does not warn for a fully-supported rule', async () => {
+    let result
+    const lines = await captureStderr(async () => {
+      result = await loadV2([
+        { id: 'r1', event: 'message.updated', condition: { type: 'messageFinished' }, instruction: 'do X' },
+      ])
+    })
+    try {
+      const warnLines = lines.filter((l) => l.includes('[warn]'))
+      assert.equal(warnLines.length, 0, `expected no warn lines, got: ${JSON.stringify(lines)}`)
+    } finally {
+      await result.pluginCleanup()
+      await result.cleanup()
     }
   })
 

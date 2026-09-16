@@ -209,9 +209,13 @@ export default Plugin.define({
                   metadata: { plugin: PLUGIN_NAME, ruleId: rule.id },
                 })
 
+                // Use the same live-cache value the skip-check and persistence
+                // warning above already use -- not the stale per-event
+                // resolvedAgentName -- so a no-op rule (target already equals
+                // the live agent) doesn't log a phantom agent transition.
                 const agentLabel = rule.switchToAgent
-                  ? `${resolvedAgentName ?? 'unknown'}→${rule.switchToAgent}`
-                  : (resolvedAgentName ?? 'unknown')
+                  ? `${currentAgent ?? 'unknown'}→${rule.switchToAgent}`
+                  : (currentAgent ?? 'unknown')
                 log(
                   `sent instruction for session=${nev.sessionID} agent=${agentLabel} ` +
                   `event=${event.type} rule=${rule.id ?? '(unnamed)'}`,
