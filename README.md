@@ -41,9 +41,18 @@ Create `~/.config/opencode/auto-instruct.json`:
 | `agents`        | `string \| string[]`      | no       | Agent name(s) to match, or `"*"`. Absent = match all agents |
 | `condition`     | `{ type, ...opts }`       | no       | Additional condition on the event. Absent = always match |
 | `instruction`   | `string`                  | **yes**  | Text sent as a new conversation message to the agent |
-| `switchToAgent` | `string`                  | no       | When set, switches the session to this agent before delivering the instruction. The new agent receives the instruction and responds under its own system prompt. The full conversation history is preserved — this is a mid-session handoff, not a fresh context. |
+| `switchToAgent` | `string`                  | no       | When set, switches the session to this agent before delivering the instruction. The new agent receives the instruction and responds under its own system prompt. The full conversation history is preserved — this is a mid-session handoff, not a fresh context. **V1/V2 divergence**: on V1 this override is scoped to the one delivery only, reverting afterward; on V2 (no per-call agent override exists in that SDK) it is a **persistent, session-level** switch — the session stays on the new agent for all subsequent turns. See `docs/v2-compat-audit.md`. |
 | `hidden`        | `boolean`                 | no       | When `true`, the instruction text is sent to the agent only — hidden from the user in the UI (default: `false`) |
 | `noReply`       | `boolean`                 | no       | When `true`, the instruction is injected without triggering an agent response turn (default: `false`) |
+
+> **V2 support**: this plugin also ships a V2 adapter (`opencode-auto-instruct/v2`,
+> for `@opencode/cli`/`@opencode/plugin`). **Current limitation**: V2's event
+> vocabulary has no `todo.updated`, `message.updated`, or `tool.execute.after`
+> event, so the `todo.updated`-condition and `tool*`-condition rule types
+> below currently never match on V2 — the plugin logs a one-time warning per
+> affected rule at load. Rules using `event: "session.created"` (or another
+> non-todo/tool event) with `messageFinished` or no condition are unaffected.
+> See `docs/v2-compat-audit.md` for the full mapping and rationale.
 
 ### Supported events
 

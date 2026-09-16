@@ -1,0 +1,379 @@
+// spec: openspec/changes/v2-plugin-migration/design.md section 6, Layer 2
+//
+// One shared conformance suite executed against a fake V1 host and a fake
+// V2 ctx -- this is what stops the two adapters drifting. Runtime-neutral
+// assertions are identical on both sides; runtime-specific assertions
+// (delivery shape, agent resolution field, cleanup) are separate per side.
+import { describe, it } from 'node:test'
+import assert from 'node:assert/strict'
+import { writeFile, mkdtemp, rm } from 'node:fs/promises'
+import { tmpdir } from 'node:os'
+import { join } from 'node:path'
+
+async function withConfigFile(rules) {
+  const dir = await mkdtemp(join(tmpdir(), 'auto-instruct-conformance-'))
+  const path = join(dir, 'auto-instruct.json')
+  await writeFile(path, JSON.stringify({ rules }))
+  process.env.OPENCODE_AUTO_INSTRUCT_CONFIG = path
+  return async () => {
+    delete process.env.OPENCODE_AUTO_INSTRUCT_CONFIG
+    await rm(dir, { recursive: true, force: true })
+  }
+}
+
+// ---------------------------------------------------------------------------
+// V1 fake host
+// ---------------------------------------------------------------------------
+
+function makeFakeV1Client({ sessionAgent = 'build' } = {}) {
+  const promptCalls = []
+  const client = {
+    app: { log: () => Promise.resolve() },
+    session: {
+      get: async () => ({ data: { agent: sessionAgent } }),
+      promptAsync: async (input) => {
+        promptCalls.push(input)
+      },
+    },
+  }
+  return { client, promptCalls }
+}
+
+async function loadV1(rules, clientOverrides = {}) {
+  const cleanup = await withConfigFile(rules)
+  try {
+    const mod = await import('../src/plugin.v1.js?t=' + Date.now())
+    const { client, promptCalls } = makeFakeV1Client(clientOverrides)
+    const hooks = await mod.default({ client })
+    return { hooks, promptCalls, cleanup }
+  } catch (err) {
+    await cleanup()
+    throw err
+  }
+}
+
+// ---------------------------------------------------------------------------
+// V2 fake ctx
+// ---------------------------------------------------------------------------
+
+function makeFakeV2Ctx({ sessionAgent = 'build' } = {}) {
+  const syntheticCalls = []
+  const switchAgentCalls = []
+  const eventListeners = []
+
+  const ctx = {
+    session: {
+      get: async () => ({ agent: sessionAgent }),
+      synthetic: async (input) => {
+        syntheticCalls.push(input)
+      },
+      switchAgent: async (input) => {
+        switchAgentCalls.push(input)
+      },
+    },
+    event: {
+      subscribe({ signal }) {
+        return {
+          [Symbol.asyncIterator]() {
+            return {
+              next() {
+                return new Promise((resolvePromise) => {
+                  eventListeners.push(resolvePromise)
+                  signal.addEventListener('abort', () => resolvePromise({ done: true, value: undefined }), { once: true })
+                })
+              },
+            }
+          },
+        }
+      },
+    },
+  }
+
+  return {
+    ctx,
+    syntheticCalls,
+    switchAgentCalls,
+    emitEvent(event) {
+      const listener = eventListeners.shift()
+      listener?.({ done: false, value: event })
+    },
+  }
+}
+
+async function loadV2(rules, ctxOverrides = {}) {
+  const cleanup = await withConfigFile(rules)
+  try {
+    const mod = await import('../src/plugin.v2.js?t=' + Date.now())
+    const { ctx, syntheticCalls, switchAgentCalls, emitEvent } = makeFakeV2Ctx(ctxOverrides)
+    const pluginCleanup = await mod.default.setup(ctx)
+    return { pluginCleanup, syntheticCalls, switchAgentCalls, emitEvent, cleanup }
+  } catch (err) {
+    await cleanup()
+    throw err
+  }
+}
+
+// ---------------------------------------------------------------------------
+// Runtime-neutral assertions
+// ---------------------------------------------------------------------------
+
+describe('V1 adapter conformance', () => {
+  it('a matching rule delivers exactly one instruction', async () => {
+    const { hooks, promptCalls, cleanup } = await loadV1([
+      { id: 'r1', event: 'session.created', instruction: 'do X' },
+    ])
+    try {
+      await hooks.event({ event: { type: 'session.created', properties: { info: { id: 's1', agent: 'build' } } } })
+      assert.equal(promptCalls.length, 1)
+      assert.match(promptCalls[0].body.parts[0].text, /do X/)
+    } finally {
+      await cleanup()
+    }
+  })
+
+  it('promptAsync receives {system, noReply, agent, parts[0].synthetic}', async () => {
+    const { hooks, promptCalls, cleanup } = await loadV1([
+      { id: 'r1', event: 'session.created', instruction: 'do X', hidden: true, noReply: true, switchToAgent: 'review' },
+    ])
+    try {
+      await hooks.event({ event: { type: 'session.created', properties: { info: { id: 's1', agent: 'build' } } } })
+      const call = promptCalls[0]
+      assert.equal(call.body.noReply, true)
+      assert.equal(call.body.agent, 'review')
+      assert.equal(call.body.parts[0].synthetic, true)
+      assert.match(call.body.system, /Do not reveal/)
+    } finally {
+      await cleanup()
+    }
+  })
+
+  it('agent is read from res.data.agent', async () => {
+    const { hooks, promptCalls, cleanup } = await loadV1([
+      { id: 'r1', event: 'session.created', instruction: 'do X', agents: 'build' },
+    ])
+    try {
+      await hooks.event({ event: { type: 'session.created', properties: { info: { id: 's1' } } } })
+      assert.equal(promptCalls.length, 1)
+    } finally {
+      await cleanup()
+    }
+  })
+
+  it('events with no resolvable session ID evaluate no rules', async () => {
+    const { hooks, promptCalls, cleanup } = await loadV1([
+      { id: 'r1', event: 'session.created', instruction: 'do X' },
+    ])
+    try {
+      await hooks.event({ event: { type: 'session.created', properties: {} } })
+      assert.equal(promptCalls.length, 0)
+    } finally {
+      await cleanup()
+    }
+  })
+
+  it('a delivery failure on rule 1 does not prevent rule 2', async () => {
+    const cleanup = await withConfigFile([
+      { id: 'r1', event: 'session.created', instruction: 'fails' },
+      { id: 'r2', event: 'session.created', instruction: 'succeeds' },
+    ])
+    try {
+      const mod = await import('../src/plugin.v1.js?t=' + Date.now())
+      let call = 0
+      const client = {
+        app: { log: () => Promise.resolve() },
+        session: {
+          get: async () => ({ data: { agent: 'build' } }),
+          promptAsync: async () => {
+            call += 1
+            if (call === 1) throw new Error('boom')
+          },
+        },
+      }
+      const hooks = await mod.default({ client })
+      await hooks.event({ event: { type: 'session.created', properties: { info: { id: 's1', agent: 'build' } } } })
+      assert.equal(call, 2, 'both rules were attempted')
+    } finally {
+      await cleanup()
+    }
+  })
+})
+
+describe('V2 adapter conformance', () => {
+  it('a matching rule delivers exactly one instruction via ctx.session.synthetic', async () => {
+    const { pluginCleanup, syntheticCalls, emitEvent, cleanup } = await loadV2([
+      { id: 'r1', event: 'session.created', instruction: 'do X' },
+    ])
+    try {
+      emitEvent({ type: 'session.created', data: { sessionID: 's1', agent: 'build' } })
+      await new Promise((r) => setImmediate(r))
+      assert.equal(syntheticCalls.length, 1)
+      assert.match(syntheticCalls[0].text, /do X/)
+    } finally {
+      await pluginCleanup()
+      await cleanup()
+    }
+  })
+
+  it('synthetic receives resume:false when noReply, and omits description when hidden', async () => {
+    const { pluginCleanup, syntheticCalls, emitEvent, cleanup } = await loadV2([
+      { id: 'r1', event: 'session.created', instruction: 'do X', hidden: true, noReply: true },
+    ])
+    try {
+      emitEvent({ type: 'session.created', data: { sessionID: 's1', agent: 'build' } })
+      await new Promise((r) => setImmediate(r))
+      const call = syntheticCalls[0]
+      assert.equal(call.resume, false)
+      assert.equal(call.description, undefined)
+      assert.match(call.text, /Do not reveal/)
+    } finally {
+      await pluginCleanup()
+      await cleanup()
+    }
+  })
+
+  it('non-hidden delivery sets a description', async () => {
+    const { pluginCleanup, syntheticCalls, emitEvent, cleanup } = await loadV2([
+      { id: 'my-rule', event: 'session.created', instruction: 'do X' },
+    ])
+    try {
+      emitEvent({ type: 'session.created', data: { sessionID: 's1', agent: 'build' } })
+      await new Promise((r) => setImmediate(r))
+      assert.equal(syntheticCalls[0].description, 'my-rule')
+    } finally {
+      await pluginCleanup()
+      await cleanup()
+    }
+  })
+
+  it('agent is read from the unwrapped res.agent (not res.data.agent)', async () => {
+    const { pluginCleanup, syntheticCalls, emitEvent, cleanup } = await loadV2([
+      { id: 'r1', event: 'session.created', instruction: 'do X', agents: 'build' },
+    ], { sessionAgent: 'build' })
+    try {
+      emitEvent({ type: 'session.created', data: { sessionID: 's1' } }) // no agentHint -- forces ctx.session.get()
+      await new Promise((r) => setImmediate(r))
+      assert.equal(syntheticCalls.length, 1)
+    } finally {
+      await pluginCleanup()
+      await cleanup()
+    }
+  })
+
+  it('switchAgent is called before delivery when switchToAgent differs from the resolved agent', async () => {
+    const { pluginCleanup, switchAgentCalls, syntheticCalls, emitEvent, cleanup } = await loadV2([
+      { id: 'r1', event: 'session.created', instruction: 'do X', switchToAgent: 'review' },
+    ], { sessionAgent: 'build' })
+    try {
+      emitEvent({ type: 'session.created', data: { sessionID: 's1', agent: 'build' } })
+      await new Promise((r) => setImmediate(r))
+      assert.equal(switchAgentCalls.length, 1)
+      assert.equal(switchAgentCalls[0].agent, 'review')
+      assert.equal(syntheticCalls.length, 1)
+    } finally {
+      await pluginCleanup()
+      await cleanup()
+    }
+  })
+
+  it('switchAgent is NOT called when the target already equals the resolved agent', async () => {
+    const { pluginCleanup, switchAgentCalls, emitEvent, cleanup } = await loadV2([
+      { id: 'r1', event: 'session.created', instruction: 'do X', switchToAgent: 'build' },
+    ], { sessionAgent: 'build' })
+    try {
+      emitEvent({ type: 'session.created', data: { sessionID: 's1', agent: 'build' } })
+      await new Promise((r) => setImmediate(r))
+      assert.equal(switchAgentCalls.length, 0)
+    } finally {
+      await pluginCleanup()
+      await cleanup()
+    }
+  })
+
+  it('todo-derived and tool-derived conditions never match on V2 (D3(a))', async () => {
+    const { pluginCleanup, syntheticCalls, emitEvent, cleanup } = await loadV2([
+      { id: 'r1', event: 'todo.updated', condition: { type: 'allTodosComplete' }, instruction: 'do X' },
+    ])
+    try {
+      // No V2 event maps to kind: 'todo.updated' at all (D3(a)), so even
+      // emitting an unrelated event must never trigger this rule.
+      emitEvent({ type: 'session.created', data: { sessionID: 's1', agent: 'build' } })
+      await new Promise((r) => setImmediate(r))
+      assert.equal(syntheticCalls.length, 0)
+    } finally {
+      await pluginCleanup()
+      await cleanup()
+    }
+  })
+
+  it('events with no resolvable session ID evaluate no rules', async () => {
+    const { pluginCleanup, syntheticCalls, emitEvent, cleanup } = await loadV2([
+      { id: 'r1', event: 'session.created', instruction: 'do X' },
+    ])
+    try {
+      emitEvent({ type: 'session.created', data: {} })
+      await new Promise((r) => setImmediate(r))
+      assert.equal(syntheticCalls.length, 0)
+    } finally {
+      await pluginCleanup()
+      await cleanup()
+    }
+  })
+
+  it('cleanup aborts the event subscription without throwing', async () => {
+    const { pluginCleanup, cleanup } = await loadV2([])
+    try {
+      await pluginCleanup()
+    } finally {
+      await cleanup()
+    }
+  })
+
+  it('a delivery failure on rule 1 does not prevent rule 2', async () => {
+    const cleanup = await withConfigFile([
+      { id: 'r1', event: 'session.created', instruction: 'fails' },
+      { id: 'r2', event: 'session.created', instruction: 'succeeds' },
+    ])
+    try {
+      const mod = await import('../src/plugin.v2.js?t=' + Date.now())
+      let call = 0
+      const eventListeners = []
+      const ctx = {
+        session: {
+          get: async () => ({ agent: 'build' }),
+          synthetic: async () => {
+            call += 1
+            if (call === 1) throw new Error('boom')
+          },
+          switchAgent: async () => {},
+        },
+        event: {
+          subscribe({ signal }) {
+            return {
+              [Symbol.asyncIterator]() {
+                return {
+                  next() {
+                    return new Promise((resolvePromise) => {
+                      eventListeners.push(resolvePromise)
+                      signal.addEventListener('abort', () => resolvePromise({ done: true, value: undefined }), { once: true })
+                    })
+                  },
+                }
+              },
+            }
+          },
+        },
+      }
+      const pluginCleanup = await mod.default.setup(ctx)
+      try {
+        const listener = eventListeners.shift()
+        listener?.({ done: false, value: { type: 'session.created', data: { sessionID: 's1', agent: 'build' } } })
+        await new Promise((r) => setImmediate(r))
+        assert.equal(call, 2, 'both rules were attempted')
+      } finally {
+        await pluginCleanup()
+      }
+    } finally {
+      await cleanup()
+    }
+  })
+})
