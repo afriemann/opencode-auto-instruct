@@ -27,69 +27,99 @@ SDK.
 | V1 (`opencode-ai`/`@opencode-ai/plugin`, current default) | `opencode-auto-instruct` or `opencode-auto-instruct/v1` |
 | V2 (`@opencode/cli`/`@opencode/plugin`) | `opencode-auto-instruct/v2` |
 
-## Critical finding: V2 has no todo domain and no tool-name-carrying events
+## Critical finding: V2 has no server-side todo-management tool (toolName/toolNameIn are supported)
 
-This is the most important fact about this port, found during design review
-by checking the actual installed `@opencode/plugin` 2.0.4 type surface (not
-assumed from a plausible-sounding hook name): **V2's event vocabulary has no
-`todo.updated`, no `message.updated`, and no `tool.execute.after` event at
-all.** The string `todo` does not occur anywhere in the 2.0.4 client type
-surface.
+This is the most important fact about this port, corrected by a later
+architectural review that read the real V2 source tree directly (tag
+v2.0.6, not just the installed `@opencode/plugin` 2.0.4 type surface).
 
-**Consequence:** of the 12 condition types this plugin supports, **9 are
-todo-derived and 2 are tool-name-derived — all 11 currently have no V2 event
-source.** Only `messageFinished` maps (to `session.step.ended`'s `data.finish`
-field, with error/failure finishes treated as non-matches — see below).
+**`toolName`/`toolNameIn` are supported — the original "no tool-name-carrying
+event" conclusion was wrong.** V2 exposes a separate hook registration,
+`ctx.tool.hook("execute.after", callback)` (distinct from
+`ctx.event.subscribe()` — confirmed in `packages/core/src/tool.ts` and
+`packages/plugin/src/promise/adapter.ts`), that fires for every tool call,
+built-in or custom, with a stable payload: `{tool, sessionID, agent,
+messageID, id, input} & ({status:"completed", result}|{status:"error",
+error})`. The plugin now registers this hook alongside
+`ctx.event.subscribe()` and evaluates `toolName`/`toolNameIn` against it —
+these condition types match correctly on V2.
 
-**Current scope of this port:** rules using any of the 11 unsupported
-condition types are logged as unsupported, once per rule, at plugin load
-time on V2 — they never match, but the plugin does not go silently deaf
-about it:
+**The 9 todo-derived condition types remain unsupported — but for a
+different, now-confirmed reason.** Exhaustively enumerating V2's built-in
+tool registrations (every file under `packages/core/src/tool/plugin/`, plus
+a repo-wide grep for `todo` outside UI/test/i18n code) found **no
+server-side todo-management tool exists in V2 at all** as of tag v2.0.6.
+There is no `todowrite`/`todoread` tool, and no `todo.*` event either — so
+there is nothing for `ctx.tool.hook` (or any other mechanism) to observe
+todo state from. The original audit's reasoning ("no dedicated
+`todo.updated` event") was correct in outcome but incomplete in cause; this
+is the corrected, more fundamental reason.
+
+**Consequence:** of the 12 condition types this plugin supports, the 9
+todo-derived types (`allTodosComplete`, `anyTodosComplete`,
+`noTodosInProgress`, `hasTodos`, `todoListCreated`, `todoListCleared`,
+`firstTodoStarted`, `allTodosCompleteOnce`, `todoCountAtLeast`) have no V2
+source and never match on that runtime. `toolName`, `toolNameIn`, and
+`messageFinished` are all supported.
+
+**Current scope:** rules using any of the 9 todo-derived condition types
+are logged as unsupported, once per rule, at plugin load time on V2 — they
+never match, but the plugin does not go silently deaf about it:
 
 ```
 [opencode-auto-instruct] [warn] rule=my-rule uses condition type "allTodosComplete",
-which has no V2 event source as of @opencode/cli 2.0.4 (no todo domain, no
-tool-name-carrying event) -- this rule will never match on this runtime
+which has no V2 event or tool-call source as of @opencode/cli 2.0.6 (no
+server-side todo-management tool exists) -- this rule will never match on
+this runtime
 ```
 
-**A recovery path exists but is out of scope for this change**: V2's
-`session.message.content.updated` event carries tool-part `name` and
-completed `state.input`, so todo state (and tool names) are theoretically
-reconstructable from a todo-management tool's completed input. This was
-identified during design review as a future enhancement — it depends on an
-untyped assumption about a specific tool's shape and was not implemented
-here, to keep this port's scope bounded and its correctness verifiable.
+**Recovering the 9 todo-derived types is out of this plugin's control**:
+it would require V2 itself to gain a server-side todo-management tool (or
+an equivalent event) for the plugin to hook into in the first place. There
+is nothing to synthesize this from today.
 
-If your rules rely only on `event: "session.created"` (or another event
-that isn't todo/tool-derived) with `messageFinished` or no condition at all,
-they are unaffected — the migration below is fully in scope.
+If your rules rely only on `event: "session.created"`, `messageFinished`,
+`toolName`/`toolNameIn`, or no condition at all, they are unaffected — the
+migration below is fully in scope.
 
 ## V1 → V2 API mapping
 
 | V1 | V2 | Note |
 |---|---|---|
 | `event` hook | `ctx.event.subscribe({signal})` | Async iterator over the full event stream; started detached (not awaited) in `setup()`. |
+| `tool.execute.after` event | `ctx.tool.hook("execute.after", callback)` | A **separate** hook registration, not part of `ctx.event.subscribe()`. Fires for every tool call with `{tool, sessionID, agent, messageID, id, input} & ({status:"completed", result}|{status:"error", error})`. Confirmed against V2 source (`packages/core/src/tool.ts`, `packages/plugin/src/promise/adapter.ts`, tag v2.0.6). This is what makes `toolName`/`toolNameIn` supported on V2. |
 | `client.session.get({path:{id}}) → res.data.agent` | `ctx.session.get({sessionID}) → res.agent` | **Unwrapped** on V2 — a real silent-failure risk if the V1 access pattern is copied naively. |
 | `client.session.promptAsync({system, noReply, agent, parts:[{text, synthetic}]})` | `ctx.session.synthetic({sessionID, text, description, resume, metadata})` | **Not** `ctx.session.prompt` — that method has no system/hidden/synthetic framing in its schema. `synthetic` is V2's documented mechanism for an out-of-band injected message. |
 | `body.noReply: true` | `resume: false` | Documented V2 equivalent: "schedule agent-loop execution unless resume is false." |
 | `parts[0].synthetic` / `rule.hidden` | omit `description` | Source-confirmed (not doc-confirmed): the V2 TUI renders a synthetic row only when `description` is non-empty. |
 | `body.system: <framing>` | prepended into `text` | `SessionSyntheticInput` has no `system` field. |
-| `body.agent: <target>` (`switchToAgent`) | `ctx.session.switchAgent({sessionID, agent})` **before** delivery | See the persistence caveat below — this is a real behavioral difference, not a mechanical translation. |
+| `body.agent: <target>` (`switchToAgent`) | `ctx.session.switchAgent({sessionID, agent})` **before** delivery | See the durable-handoff note below — this is a real behavioral difference, not a mechanical translation. |
 | `client.app.log` | stderr only | V2's `Context.app` has no `log` method. |
 
-## Known behavioral difference: `switchToAgent` is persistent on V2
+## `switchToAgent` is a durable, session-level handoff on V2
 
 V1's `switchToAgent` scopes an agent override to **one delivery only** — the
-session reverts to its original agent afterward. V2 has no per-call agent
-override on `session.prompt`/`session.synthetic`; its only mechanism,
+session reverts to its original agent afterward. V2's only mechanism,
 `ctx.session.switchAgent`, is documented as changing "the agent used by
 **subsequent** provider turns" — a persistent, session-level change.
 
-The V2 adapter therefore calls `switchAgent` before delivering a
-`switchToAgent` rule's instruction (skipping the call when the target
-already equals the resolved agent, to avoid redundant persistent writes) and
-**logs the persistence once per session per rule**, naming the previous
-agent, so the log line doubles as the "how to switch back" note:
+This is not a capability V2 lacks relative to V1 — it is a **better fit for
+the durable-handoff use case this feature exists for**. The plugin's own
+`review-on-completion` example (see `README.md`) models exactly this: when
+implementation todos are all complete, switch the session to
+`code-reviewer` so it can review with the full conversation history intact,
+before the `engineer` agent commits. That is a durable handoff by design —
+the point is for the review to happen under the new agent for the rest of
+the session, not to revert after one message. V2's session-level
+persistence expresses this intent more directly than V1's revert-after-one-
+delivery scoping ever did; V1's scoping was, if anything, the more awkward
+fit for this pattern.
+
+The V2 adapter calls `switchAgent` before delivering a `switchToAgent`
+rule's instruction (skipping the call when the target already equals the
+resolved agent, to avoid redundant persistent writes) and **logs the
+persistence once per session per rule**, naming the previous agent, so the
+log line doubles as a clear record of the handoff:
 
 ```
 [opencode-auto-instruct] [warn] rule=my-rule persistently switched session=ses_...
@@ -103,8 +133,10 @@ and rejected: `synthetic` enqueues into the session inbox, and with
 restore would race that consumption (the instruction might run under the
 *original* agent, silently defeating the rule, or the restore might land
 mid-turn). There is no delivery-scoped completion signal to sequence
-against. A visible, deterministic side effect (persistence) was judged
-better than an invisible, nondeterministic one (a racing restore).
+against. For a genuinely scoped, single-delivery agent override (rather
+than a durable handoff), V1's revert-after-one-message semantics remain the
+right tool — that pattern has no safe equivalent on V2 and is out of scope
+for this plugin to fake.
 
 ## Verified: `ctx.session.synthetic()` reaches model-visible context
 
@@ -143,7 +175,9 @@ unaffected (the default path is unchanged).
 - `test/plugin-conformance.test.js` (Layer 2): one shared suite exercised
   against a fake V1 host and a fake V2 `ctx` for runtime-neutral behavior,
   plus runtime-specific assertions (delivery shape, the unwrapped
-  `session.get`, the `switchAgent` guard, cleanup).
+  `session.get`, the `switchAgent` guard, cleanup, and — since this
+  correction — a fake `ctx.tool.hook("execute.after", ...)` registration
+  exercising `toolName`/`toolNameIn` matching on V2).
 - `npm run test:e2e` (Layer 3, not part of default `npm test`): the
   release-blocking gate described above, run against the real, pinned
   `@opencode/cli` binary with an isolated config path.
