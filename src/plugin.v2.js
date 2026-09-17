@@ -6,18 +6,24 @@
 //
 //   V1                                     V2
 //   event hook                             ctx.event.subscribe({signal})
+//   tool.execute.after event               ctx.tool.hook('execute.after', cb) -- a SEPARATE hook registration, not part of ctx.event.subscribe()
 //   client.session.get                     ctx.session.get({sessionID}) -- UNWRAPPED (res.agent, not res.data.agent)
 //   client.session.promptAsync             ctx.session.synthetic({sessionID, text, description, resume, metadata})
 //   client.app.log                         stderr only (Context.app has no log method)
 //
 // Key differences from V1 (see design.md D2-D8 for the full analysis):
-//   - V2 has NO todo.updated / message.updated / tool.execute.after events
-//     (confirmed against the installed @opencode/schema event manifest --
-//     no todo domain exists at all). The 11 condition types that depend on
-//     these (9 todo-derived + toolName/toolNameIn) have no V2 event source
-//     and are logged as unsupported per-rule at load time (design.md D3(a)
-//     -- the documented current-scope fallback; synthesizing them from
-//     session.message.content.updated is future work, not done here).
+//   - V2 has no `todo.updated` event and no server-side todo-management
+//     tool at all (confirmed by exhaustively enumerating V2's built-in tool
+//     registrations, tag v2.0.6 -- there is nothing for any hook to observe
+//     todo state from). The 9 todo-derived condition types have no V2
+//     source and are logged as unsupported per-rule at load time
+//     (V2_UNSUPPORTED_CONDITION_TYPES / V2_UNSUPPORTED_EVENT_TYPES).
+//   - `toolName`/`toolNameIn` ARE supported on V2: `ctx.tool.hook`
+//     ("execute.after", callback)` (confirmed against the V2 source,
+//     packages/core/src/tool.ts and packages/plugin/src/promise/adapter.ts,
+//     tag v2.0.6) fires for every tool call with the tool name, session ID,
+//     and agent directly in the payload -- a second, independent event
+//     intake path alongside ctx.event.subscribe().
 //   - messageFinished uses session.step.ended's data.finish, treating an
 //     error/failure finish as a non-match (V1 semantics: a *successful*
 //     finish, not "any finish occurred").
@@ -54,11 +60,11 @@ function makeLogger() {
 }
 
 /**
- * Normalizes a raw V2 event into core.js's NormalizedEvent shape. V2
- * events carry their payload under `event.data`, in a richer envelope
- * (design.md D1). Only `session.created` currently maps to a `kind` this
- * plugin acts on for todo/tool purposes -- the others have no V2 source
- * (see V2_UNSUPPORTED_CONDITION_TYPES).
+ * Normalizes a raw event from ctx.event.subscribe() into core.js's
+ * NormalizedEvent shape. V2 events carry their payload under `event.data`,
+ * in a richer envelope (design.md D1). Only `session.created` and
+ * `session.step.ended` currently map to a `kind` this plugin acts on --
+ * `todo.updated` has no V2 source at all (see V2_UNSUPPORTED_EVENT_TYPES).
  */
 function normalize(event) {
   const data = event.data ?? {}
@@ -106,6 +112,24 @@ function normalize(event) {
   }
 }
 
+/**
+ * Normalizes a ctx.tool.hook("execute.after", ...) payload into core.js's
+ * NormalizedEvent shape. This is a separate intake path from
+ * ctx.event.subscribe() -- the hook fires for every tool invocation and
+ * carries the tool name directly, unlike anything in the event stream.
+ */
+function normalizeToolEvent(toolEvent) {
+  return {
+    kind: 'tool.execute.after',
+    raw: toolEvent,
+    sessionID: toolEvent.sessionID ?? null,
+    agentHint: toolEvent.agent ?? null,
+    todos: null,
+    toolName: toolEvent.tool ?? null,
+    finish: null,
+  }
+}
+
 export default Plugin.define({
   id: PLUGIN_NAME,
   async setup(ctx) {
@@ -113,26 +137,26 @@ export default Plugin.define({
     const { rules, debug } = await loadRules(log, ctx.options ?? {})
     log(`loaded ${rules.length} rule(s)${debug ? ' (debug mode ON)' : ''}`)
 
-    // design.md D3(a): warn once per rule at load time for any condition
-    // type -- OR any trigger event type -- with no V2 event source, rather
-    // than silently never firing. A rule with no condition (or an
-    // unrelated one) bound to an unsupported event is just as dead as one
-    // with an unsupported condition type, and was the specific "loads
-    // cleanly, logs nothing, never fires" failure mode design.md section 2
-    // calls out as the worst outcome available.
+    // Warn once per rule at load time for any condition type -- OR any
+    // trigger event type -- with no V2 source, rather than silently never
+    // firing. A rule with no condition (or an unrelated one) bound to an
+    // unsupported event is just as dead as one with an unsupported
+    // condition type, and was the specific "loads cleanly, logs nothing,
+    // never fires" failure mode design.md section 2 calls out as the worst
+    // outcome available.
     for (const rule of rules) {
       const condType = rule.condition?.type
       if (condType && V2_UNSUPPORTED_CONDITION_TYPES.has(condType)) {
         log(
           `rule=${rule.id ?? '(unnamed)'} uses condition type "${condType}", which has no V2 event ` +
-          `source as of @opencode/cli 2.0.4 (no todo domain, no tool-name-carrying event) -- ` +
+          `or tool-call source as of @opencode/cli 2.0.6 (no server-side todo-management tool exists) -- ` +
           `this rule will never match on this runtime`,
           null, 'warn',
         )
       } else if (V2_UNSUPPORTED_EVENT_TYPES.has(rule.event)) {
         log(
           `rule=${rule.id ?? '(unnamed)'} targets event "${rule.event}", which has no V2 event ` +
-          `source as of @opencode/cli 2.0.4 -- this rule will never match on this runtime`,
+          `source as of @opencode/cli 2.0.6 -- this rule will never match on this runtime`,
           null, 'warn',
         )
       }
@@ -161,69 +185,90 @@ export default Plugin.define({
       }
     }
 
+    /**
+     * Shared handling for a normalized event, regardless of which intake
+     * path (ctx.event.subscribe() or ctx.tool.hook()) produced it.
+     */
+    async function handleNormalizedEvent(nev) {
+      if (!nev.sessionID) return
+
+      if (nev.agentHint) sessionAgents.set(nev.sessionID, nev.agentHint)
+
+      const agentName = await resolveAgent(nev.sessionID)
+      const sessionState = getSessionState(nev.sessionID)
+      const decisions = evaluate(rules, nev, agentName, sessionState, log, debug)
+
+      for (const { rule, agentName: resolvedAgentName } of decisions) {
+        try {
+          // Re-read the live agent cache, not the stale per-event
+          // resolvedAgentName -- if an earlier rule in this same
+          // decisions loop already switched the agent, a later rule
+          // targeting the same agent must not redundantly call
+          // switchAgent again or double-log the persistence warning.
+          const currentAgent = sessionAgents.get(nev.sessionID) ?? resolvedAgentName
+          if (rule.switchToAgent && rule.switchToAgent !== currentAgent) {
+            await ctx.session.switchAgent({ sessionID: nev.sessionID, agent: rule.switchToAgent })
+            const loggedRules = switchAgentLoggedFor.get(nev.sessionID) ?? new Set()
+            if (!loggedRules.has(rule.id)) {
+              log(
+                `rule=${rule.id ?? '(unnamed)'} persistently switched session=${nev.sessionID} ` +
+                `from agent=${currentAgent ?? 'unknown'} to agent=${rule.switchToAgent} -- ` +
+                `this is a session-level change on V2, not scoped to this one delivery`,
+                null, 'warn',
+              )
+              loggedRules.add(rule.id)
+              switchAgentLoggedFor.set(nev.sessionID, loggedRules)
+            }
+            sessionAgents.set(nev.sessionID, rule.switchToAgent)
+          }
+
+          const { text } = buildFraming(rule)
+          await ctx.session.synthetic({
+            sessionID: nev.sessionID,
+            text,
+            description: rule.hidden === true ? undefined : (rule.id ?? 'auto-instruct'),
+            resume: rule.noReply === true ? false : undefined,
+            metadata: { plugin: PLUGIN_NAME, ruleId: rule.id },
+          })
+
+          // Use the same live-cache value the skip-check and persistence
+          // warning above already use -- not the stale per-event
+          // resolvedAgentName -- so a no-op rule (target already equals
+          // the live agent) doesn't log a phantom agent transition.
+          const agentLabel = rule.switchToAgent
+            ? `${currentAgent ?? 'unknown'}→${rule.switchToAgent}`
+            : (currentAgent ?? 'unknown')
+          log(
+            `sent instruction for session=${nev.sessionID} agent=${agentLabel} ` +
+            `event=${nev.kind} rule=${rule.id ?? '(unnamed)'}`,
+          )
+        } catch (err) {
+          log(`failed to send instruction for session=${nev.sessionID} rule=${rule.id ?? '(unnamed)'}`, err)
+        }
+      }
+    }
+
+    // Second, independent intake path: ctx.tool.hook fires for every tool
+    // call, host-wide, and is NOT part of the ctx.event.subscribe() stream.
+    // Guarded the same way as the event-subscribe loop -- one malformed
+    // tool event must not break subsequent tool calls.
+    if (ctx.tool?.hook) {
+      ctx.tool.hook('execute.after', async (toolEvent) => {
+        try {
+          await handleNormalizedEvent(normalizeToolEvent(toolEvent))
+        } catch (err) {
+          log('tool hook handler error', err)
+        }
+      })
+    }
+
     const abortController = new AbortController()
 
     ;(async () => {
       try {
         for await (const event of ctx.event.subscribe({ signal: abortController.signal })) {
           try {
-            const nev = normalize(event)
-            if (!nev.sessionID) continue
-
-            if (nev.agentHint) sessionAgents.set(nev.sessionID, nev.agentHint)
-
-            const agentName = await resolveAgent(nev.sessionID)
-            const sessionState = getSessionState(nev.sessionID)
-            const decisions = evaluate(rules, nev, agentName, sessionState, log, debug)
-
-            for (const { rule, agentName: resolvedAgentName } of decisions) {
-              try {
-                // Re-read the live agent cache, not the stale per-event
-                // resolvedAgentName -- if an earlier rule in this same
-                // decisions loop already switched the agent, a later rule
-                // targeting the same agent must not redundantly call
-                // switchAgent again or double-log the persistence warning.
-                const currentAgent = sessionAgents.get(nev.sessionID) ?? resolvedAgentName
-                if (rule.switchToAgent && rule.switchToAgent !== currentAgent) {
-                  await ctx.session.switchAgent({ sessionID: nev.sessionID, agent: rule.switchToAgent })
-                  const loggedRules = switchAgentLoggedFor.get(nev.sessionID) ?? new Set()
-                  if (!loggedRules.has(rule.id)) {
-                    log(
-                      `rule=${rule.id ?? '(unnamed)'} persistently switched session=${nev.sessionID} ` +
-                      `from agent=${currentAgent ?? 'unknown'} to agent=${rule.switchToAgent} -- ` +
-                      `this is a session-level change on V2, not scoped to this one delivery`,
-                      null, 'warn',
-                    )
-                    loggedRules.add(rule.id)
-                    switchAgentLoggedFor.set(nev.sessionID, loggedRules)
-                  }
-                  sessionAgents.set(nev.sessionID, rule.switchToAgent)
-                }
-
-                const { text } = buildFraming(rule)
-                await ctx.session.synthetic({
-                  sessionID: nev.sessionID,
-                  text,
-                  description: rule.hidden === true ? undefined : (rule.id ?? 'auto-instruct'),
-                  resume: rule.noReply === true ? false : undefined,
-                  metadata: { plugin: PLUGIN_NAME, ruleId: rule.id },
-                })
-
-                // Use the same live-cache value the skip-check and persistence
-                // warning above already use -- not the stale per-event
-                // resolvedAgentName -- so a no-op rule (target already equals
-                // the live agent) doesn't log a phantom agent transition.
-                const agentLabel = rule.switchToAgent
-                  ? `${currentAgent ?? 'unknown'}→${rule.switchToAgent}`
-                  : (currentAgent ?? 'unknown')
-                log(
-                  `sent instruction for session=${nev.sessionID} agent=${agentLabel} ` +
-                  `event=${event.type} rule=${rule.id ?? '(unnamed)'}`,
-                )
-              } catch (err) {
-                log(`failed to send instruction for session=${nev.sessionID} rule=${rule.id ?? '(unnamed)'}`, err)
-              }
-            }
+            await handleNormalizedEvent(normalize(event))
           } catch (err) {
             // One malformed event must not kill the subscription loop.
             log('event handler error', err)

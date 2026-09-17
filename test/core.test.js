@@ -308,15 +308,17 @@ describe('evaluate', () => {
 })
 
 describe('V2_UNSUPPORTED_CONDITION_TYPES', () => {
-  it('lists exactly the 9 todo-derived + 2 tool-derived types', () => {
+  it('lists exactly the 9 todo-derived types (toolName/toolNameIn are supported via ctx.tool.hook)', () => {
     assert.deepEqual(
       [...V2_UNSUPPORTED_CONDITION_TYPES].sort(),
       [
         'allTodosComplete', 'allTodosCompleteOnce', 'anyTodosComplete',
         'firstTodoStarted', 'hasTodos', 'noTodosInProgress', 'todoCountAtLeast',
-        'todoListCleared', 'todoListCreated', 'toolName', 'toolNameIn',
+        'todoListCleared', 'todoListCreated',
       ].sort(),
     )
     assert.equal(V2_UNSUPPORTED_CONDITION_TYPES.has('messageFinished'), false)
+    assert.equal(V2_UNSUPPORTED_CONDITION_TYPES.has('toolName'), false)
+    assert.equal(V2_UNSUPPORTED_CONDITION_TYPES.has('toolNameIn'), false)
   })
 })

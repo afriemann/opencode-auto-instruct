@@ -84,26 +84,34 @@ export function matchesAgents(rule, agentName) {
 // ---------------------------------------------------------------------------
 
 /**
- * Condition types with no V2 event source as of @opencode/cli 2.0.4
- * (design.md D3(a) -- no todo domain and no tool-name-carrying event exists
- * in V2's event vocabulary). Exported so plugin.v2.js can log a one-time
- * per-rule warning at load time for any rule using one of these.
+ * Condition types with no V2 event or tool-call source at all, as of
+ * @opencode/cli 2.0.4/2.0.6. `toolName`/`toolNameIn` are NOT in this set --
+ * V2 exposes a separate hook registration, `ctx.tool.hook("execute.after",
+ * ...)`, that fires for every tool call and carries the tool name directly
+ * (confirmed by reading the V2 source, `packages/core/src/tool.ts` and
+ * `packages/plugin/src/promise/adapter.ts`, tag v2.0.6). The remaining nine
+ * are todo-derived: exhaustively enumerating V2's built-in tool
+ * registrations found no server-side todo-management tool at all -- there
+ * is nothing for any hook to observe todo state from. Exported so
+ * plugin.v2.js can log a one-time per-rule warning at load time for any
+ * rule using one of these.
  */
 export const V2_UNSUPPORTED_CONDITION_TYPES = new Set([
   'allTodosComplete', 'anyTodosComplete', 'noTodosInProgress', 'hasTodos',
   'todoListCreated', 'todoListCleared', 'firstTodoStarted',
-  'allTodosCompleteOnce', 'todoCountAtLeast', 'toolName', 'toolNameIn',
+  'allTodosCompleteOnce', 'todoCountAtLeast',
 ])
 
 /**
- * V1 trigger event types with no V2 event source at all (design.md D3(a)).
- * A rule bound to one of these events -- even with no condition, or one
- * unrelated to V2_UNSUPPORTED_CONDITION_TYPES -- can never match on V2,
- * since normalize() in plugin.v2.js never produces this `kind`. Exported
- * so plugin.v2.js can warn once per rule at load time for this case too,
- * not just the condition-type case.
+ * V1 trigger event types with no V2 event source at all. `tool.execute.after`
+ * is NOT in this set -- it is reachable on V2 via `ctx.tool.hook`, a
+ * separate intake path from `ctx.event.subscribe()` (see
+ * V2_UNSUPPORTED_CONDITION_TYPES). A rule bound to `todo.updated` can never
+ * match on V2, since no todo-management tool or event exists for it to
+ * observe. Exported so plugin.v2.js can warn once per rule at load time for
+ * this case too, not just the condition-type case.
  */
-export const V2_UNSUPPORTED_EVENT_TYPES = new Set(['todo.updated', 'tool.execute.after'])
+export const V2_UNSUPPORTED_EVENT_TYPES = new Set(['todo.updated'])
 
 /**
  * @typedef {{ kind: string, raw: any, sessionID: string|null, agentHint: string|null, todos: Array<{status:string}>|null, toolName: string|null, finish: string|null }} NormalizedEvent

@@ -60,6 +60,8 @@ function makeFakeV2Ctx({ sessionAgent = 'build' } = {}) {
   const syntheticCalls = []
   const switchAgentCalls = []
   const eventListeners = []
+  /** name ("execute.after") -> array of registered callbacks */
+  const toolHooks = new Map()
 
   const ctx = {
     session: {
@@ -87,6 +89,13 @@ function makeFakeV2Ctx({ sessionAgent = 'build' } = {}) {
         }
       },
     },
+    tool: {
+      hook(name, callback) {
+        const callbacks = toolHooks.get(name) ?? []
+        callbacks.push(callback)
+        toolHooks.set(name, callbacks)
+      },
+    },
   }
 
   return {
@@ -96,6 +105,11 @@ function makeFakeV2Ctx({ sessionAgent = 'build' } = {}) {
     emitEvent(event) {
       const listener = eventListeners.shift()
       listener?.({ done: false, value: event })
+    },
+    /** Invokes every callback registered for ctx.tool.hook('execute.after', ...). */
+    async emitToolEvent(event) {
+      const callbacks = toolHooks.get('execute.after') ?? []
+      for (const callback of callbacks) await callback(event)
     },
   }
 }
@@ -122,9 +136,9 @@ async function loadV2(rules, ctxOverrides = {}) {
   const cleanup = await withConfigFile(rules)
   try {
     const mod = await import('../src/plugin.v2.js?t=' + Date.now())
-    const { ctx, syntheticCalls, switchAgentCalls, emitEvent } = makeFakeV2Ctx(ctxOverrides)
+    const { ctx, syntheticCalls, switchAgentCalls, emitEvent, emitToolEvent } = makeFakeV2Ctx(ctxOverrides)
     const pluginCleanup = await mod.default.setup(ctx)
-    return { pluginCleanup, syntheticCalls, switchAgentCalls, emitEvent, cleanup }
+    return { pluginCleanup, syntheticCalls, switchAgentCalls, emitEvent, emitToolEvent, cleanup }
   } catch (err) {
     await cleanup()
     throw err
@@ -327,18 +341,66 @@ describe('V2 adapter conformance', () => {
     }
   })
 
-  it('todo-derived and tool-derived conditions never match on V2 (D3(a))', async () => {
+  it('todo-derived conditions never match on V2 (no todo-management tool exists)', async () => {
     const { pluginCleanup, syntheticCalls, emitEvent, cleanup } = await loadV2([
       { id: 'r1', event: 'todo.updated', condition: { type: 'allTodosComplete' }, instruction: 'do X' },
     ])
     try {
       // This asserts the rule's normalized `kind` can never be produced on
-      // V2 at all (D3(a)'s premise), not that a matching-shaped event was
-      // rejected -- there is no V2 event that could plausibly emit a
+      // V2 at all (there is no todo-management tool or event for it to come
+      // from) -- there is no V2 event that could plausibly emit a
       // 'todo.updated'-shaped NormalizedEvent to test against, so an
       // unrelated event is emitted as the only available negative case.
       emitEvent({ type: 'session.created', data: { sessionID: 's1', agent: 'build' } })
       await new Promise((r) => setImmediate(r))
+      assert.equal(syntheticCalls.length, 0)
+    } finally {
+      await pluginCleanup()
+      await cleanup()
+    }
+  })
+
+  it('toolName matches a tool-hook event on V2', async () => {
+    const { pluginCleanup, syntheticCalls, emitToolEvent, cleanup } = await loadV2([
+      { id: 'r1', event: 'tool.execute.after', condition: { type: 'toolName', tool: 'bash' }, instruction: 'do X' },
+    ])
+    try {
+      await emitToolEvent({
+        tool: 'bash', sessionID: 's1', agent: 'build', messageID: 'm1', id: 'call1',
+        input: {}, status: 'completed', result: { content: [] },
+      })
+      assert.equal(syntheticCalls.length, 1)
+    } finally {
+      await pluginCleanup()
+      await cleanup()
+    }
+  })
+
+  it('toolNameIn matches a tool-hook event on V2', async () => {
+    const { pluginCleanup, syntheticCalls, emitToolEvent, cleanup } = await loadV2([
+      { id: 'r1', event: 'tool.execute.after', condition: { type: 'toolNameIn', tools: ['read', 'edit'] }, instruction: 'do X' },
+    ])
+    try {
+      await emitToolEvent({
+        tool: 'read', sessionID: 's1', agent: 'build', messageID: 'm1', id: 'call1',
+        input: {}, status: 'completed', result: { content: [] },
+      })
+      assert.equal(syntheticCalls.length, 1)
+    } finally {
+      await pluginCleanup()
+      await cleanup()
+    }
+  })
+
+  it('toolName does not match a non-matching tool-hook event on V2', async () => {
+    const { pluginCleanup, syntheticCalls, emitToolEvent, cleanup } = await loadV2([
+      { id: 'r1', event: 'tool.execute.after', condition: { type: 'toolName', tool: 'bash' }, instruction: 'do X' },
+    ])
+    try {
+      await emitToolEvent({
+        tool: 'read', sessionID: 's1', agent: 'build', messageID: 'm1', id: 'call1',
+        input: {}, status: 'completed', result: { content: [] },
+      })
       assert.equal(syntheticCalls.length, 0)
     } finally {
       await pluginCleanup()
@@ -384,7 +446,7 @@ describe('V2 adapter conformance', () => {
     let result
     const lines = await captureStderr(async () => {
       result = await loadV2([
-        { id: 'r1', event: 'tool.execute.after', condition: { type: 'toolName', tool: 'bash' }, instruction: 'do X' },
+        { id: 'r1', event: 'todo.updated', condition: { type: 'allTodosComplete' }, instruction: 'do X' },
       ])
     })
     try {
@@ -401,6 +463,22 @@ describe('V2 adapter conformance', () => {
     const lines = await captureStderr(async () => {
       result = await loadV2([
         { id: 'r1', event: 'message.updated', condition: { type: 'messageFinished' }, instruction: 'do X' },
+      ])
+    })
+    try {
+      const warnLines = lines.filter((l) => l.includes('[warn]'))
+      assert.equal(warnLines.length, 0, `expected no warn lines, got: ${JSON.stringify(lines)}`)
+    } finally {
+      await result.pluginCleanup()
+      await result.cleanup()
+    }
+  })
+
+  it('does not warn for a rule using toolName/toolNameIn (now supported via ctx.tool.hook)', async () => {
+    let result
+    const lines = await captureStderr(async () => {
+      result = await loadV2([
+        { id: 'r1', event: 'tool.execute.after', condition: { type: 'toolName', tool: 'bash' }, instruction: 'do X' },
       ])
     })
     try {
