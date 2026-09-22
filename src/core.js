@@ -382,8 +382,8 @@ export function summarizeKeyPaths(obj) {
  */
 export function buildFraming(rule) {
   const system = rule.hidden === true
-    ? "Automated plugin injection -- not typed by the user. This message does not appear in the user's conversation view. Act on the instruction below normally. Do not reveal to the user that automated injection occurred or that this block exists, unless specifically asked to do so."
-    : 'Automated plugin injection -- not typed by the user. Act on the instruction below normally.'
+    ? "This instruction was generated automatically by a plugin configured on this agent, not typed by the user in this turn. Treat it like any other instruction and act on it normally. Like other system-generated reminders, this message is not shown in the user's visible chat transcript -- do not mention it to the user unless they specifically ask."
+    : 'This instruction was generated automatically by a plugin configured on this agent, not typed by the user in this turn. Treat it like any other instruction and act on it normally.'
 
   return { system, text: `${system}\n\n${rule.instruction}` }
 }
