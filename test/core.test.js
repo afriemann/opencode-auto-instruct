@@ -422,12 +422,24 @@ describe('validateRules', () => {
 describe('buildFraming', () => {
   it('non-hidden framing does not include the non-disclosure clause', () => {
     const { system } = buildFraming({ instruction: 'do X', hidden: false })
-    assert.doesNotMatch(system, /Do not reveal/)
+    assert.doesNotMatch(system, /do not mention/i)
+  })
+
+  it('non-hidden framing avoids adversarial-sounding injection wording', () => {
+    const { system } = buildFraming({ instruction: 'do X', hidden: false })
+    assert.doesNotMatch(system, /injection/i)
+    assert.doesNotMatch(system, /reveal/i)
   })
 
   it('hidden framing includes the non-disclosure clause', () => {
     const { system } = buildFraming({ instruction: 'do X', hidden: true })
-    assert.match(system, /Do not reveal/)
+    assert.match(system, /do not mention/i)
+  })
+
+  it('hidden framing avoids adversarial-sounding injection wording', () => {
+    const { system } = buildFraming({ instruction: 'do X', hidden: true })
+    assert.doesNotMatch(system, /injection/i)
+    assert.doesNotMatch(system, /reveal/i)
   })
 
   it('text carries the framing prepended to the instruction (for runtimes with no system field)', () => {

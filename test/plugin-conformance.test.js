@@ -173,7 +173,7 @@ describe('V1 adapter conformance', () => {
       assert.equal(call.body.noReply, true)
       assert.equal(call.body.agent, 'review')
       assert.equal(call.body.parts[0].synthetic, true)
-      assert.match(call.body.system, /Do not reveal/)
+      assert.match(call.body.system, /do not mention/i)
     } finally {
       await cleanup()
     }
@@ -382,7 +382,7 @@ describe('V2 adapter conformance', () => {
       const call = syntheticCalls[0]
       assert.equal(call.resume, false)
       assert.equal(call.description, undefined)
-      assert.match(call.text, /Do not reveal/)
+      assert.match(call.text, /do not mention/i)
     } finally {
       await pluginCleanup()
       await cleanup()
