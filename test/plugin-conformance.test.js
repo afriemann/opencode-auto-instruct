@@ -228,6 +228,132 @@ describe('V1 adapter conformance', () => {
       await cleanup()
     }
   })
+
+  it('toolName fires on V1 via the real message.part.updated path', async () => {
+    const { hooks, promptCalls, cleanup } = await loadV1([
+      { id: 'r1', event: 'tool.execute.after', condition: { type: 'toolName', tool: 'bash' }, instruction: 'do X' },
+    ])
+    try {
+      await hooks.event({
+        event: {
+          type: 'message.part.updated',
+          properties: {
+            part: {
+              id: 'part1', sessionID: 's1', messageID: 'm1', type: 'tool', callID: 'call1', tool: 'bash',
+              state: { status: 'completed', input: {}, output: '', title: '', metadata: {}, time: { start: 0, end: 1 } },
+            },
+          },
+        },
+      })
+      assert.equal(promptCalls.length, 1)
+    } finally {
+      await cleanup()
+    }
+  })
+
+  it('toolNameIn fires on V1 via the real message.part.updated path', async () => {
+    const { hooks, promptCalls, cleanup } = await loadV1([
+      { id: 'r1', event: 'tool.execute.after', condition: { type: 'toolNameIn', tools: ['read', 'edit'] }, instruction: 'do X' },
+    ])
+    try {
+      await hooks.event({
+        event: {
+          type: 'message.part.updated',
+          properties: {
+            part: {
+              id: 'part1', sessionID: 's1', messageID: 'm1', type: 'tool', callID: 'call1', tool: 'read',
+              state: { status: 'completed', input: {}, output: '', title: '', metadata: {}, time: { start: 0, end: 1 } },
+            },
+          },
+        },
+      })
+      assert.equal(promptCalls.length, 1)
+    } finally {
+      await cleanup()
+    }
+  })
+
+  it('a data condition fires on V1 using part.state.metadata', async () => {
+    const { hooks, promptCalls, cleanup } = await loadV1([
+      { id: 'r1', event: 'tool.execute.after', condition: { type: 'dataArrayNonEmpty', path: 'todos', tool: 'todowrite' }, instruction: 'do X' },
+    ])
+    try {
+      await hooks.event({
+        event: {
+          type: 'message.part.updated',
+          properties: {
+            part: {
+              id: 'part1', sessionID: 's1', messageID: 'm1', type: 'tool', callID: 'call1', tool: 'todowrite',
+              state: { status: 'completed', input: {}, output: '', title: '', metadata: { todos: [{ status: 'pending' }] }, time: { start: 0, end: 1 } },
+            },
+          },
+        },
+      })
+      assert.equal(promptCalls.length, 1)
+    } finally {
+      await cleanup()
+    }
+  })
+
+  it('an in-progress (non-completed) tool part does not fire any rule (early bail)', async () => {
+    const { hooks, promptCalls, cleanup } = await loadV1([
+      { id: 'r1', event: 'tool.execute.after', condition: { type: 'toolName', tool: 'bash' }, instruction: 'do X' },
+    ])
+    try {
+      await hooks.event({
+        event: {
+          type: 'message.part.updated',
+          properties: {
+            part: { id: 'part1', sessionID: 's1', messageID: 'm1', type: 'tool', callID: 'call1', tool: 'bash', state: { status: 'running' } },
+          },
+        },
+      })
+      assert.equal(promptCalls.length, 0)
+    } finally {
+      await cleanup()
+    }
+  })
+
+  it('a repeated message.part.updated delivery for the same callID is deduplicated', async () => {
+    const { hooks, promptCalls, cleanup } = await loadV1([
+      { id: 'r1', event: 'tool.execute.after', condition: { type: 'toolName', tool: 'bash' }, instruction: 'do X' },
+    ])
+    try {
+      const part = {
+        id: 'part1', sessionID: 's1', messageID: 'm1', type: 'tool', callID: 'call1', tool: 'bash',
+        state: { status: 'completed', input: {}, output: '', title: '', metadata: {}, time: { start: 0, end: 1 } },
+      }
+      await hooks.event({ event: { type: 'message.part.updated', properties: { part } } })
+      await hooks.event({ event: { type: 'message.part.updated', properties: { part } } })
+      assert.equal(promptCalls.length, 1, 'the second delivery for the same callID must be deduplicated')
+    } finally {
+      await cleanup()
+    }
+  })
+
+  it('Session ID for a completed V1 tool part is read from the part itself', async () => {
+    const { hooks, promptCalls, cleanup } = await loadV1([
+      { id: 'r1', event: 'tool.execute.after', instruction: 'do X' },
+    ])
+    try {
+      await hooks.event({
+        event: {
+          type: 'message.part.updated',
+          // No properties.sessionID or properties.info.id anywhere on the
+          // envelope -- only part.sessionID carries it for this event kind.
+          properties: {
+            part: {
+              id: 'part1', sessionID: 's1', messageID: 'm1', type: 'tool', callID: 'call1', tool: 'bash',
+              state: { status: 'completed', input: {}, output: '', title: '', metadata: {}, time: { start: 0, end: 1 } },
+            },
+          },
+        },
+      })
+      assert.equal(promptCalls.length, 1, 'rule evaluation must proceed using part.sessionID')
+    } finally {
+      await cleanup()
+    }
+  })
 })
 
 describe('V2 adapter conformance', () => {
@@ -341,18 +467,45 @@ describe('V2 adapter conformance', () => {
     }
   })
 
-  it('todo-derived conditions never match on V2 (no todo-management tool exists)', async () => {
+  it('a legacy removed condition type never matches on V2 (removed on all runtimes)', async () => {
     const { pluginCleanup, syntheticCalls, emitEvent, cleanup } = await loadV2([
-      { id: 'r1', event: 'todo.updated', condition: { type: 'allTodosComplete' }, instruction: 'do X' },
+      { id: 'r1', event: 'tool.execute.after', condition: { type: 'allTodosComplete' }, instruction: 'do X' },
     ])
     try {
-      // This asserts the rule's normalized `kind` can never be produced on
-      // V2 at all (there is no todo-management tool or event for it to come
-      // from) -- there is no V2 event that could plausibly emit a
-      // 'todo.updated'-shaped NormalizedEvent to test against, so an
-      // unrelated event is emitted as the only available negative case.
       emitEvent({ type: 'session.created', data: { sessionID: 's1', agent: 'build' } })
       await new Promise((r) => setImmediate(r))
+      assert.equal(syntheticCalls.length, 0)
+    } finally {
+      await pluginCleanup()
+      await cleanup()
+    }
+  })
+
+  it('a data condition matches a tool-hook event on V2 using result.metadata', async () => {
+    const { pluginCleanup, syntheticCalls, emitToolEvent, cleanup } = await loadV2([
+      { id: 'r1', event: 'tool.execute.after', condition: { type: 'dataArrayNonEmpty', path: 'todos', tool: 'todowrite' }, instruction: 'do X' },
+    ])
+    try {
+      await emitToolEvent({
+        tool: 'todowrite', sessionID: 's1', agent: 'build', messageID: 'm1', id: 'call1',
+        input: {}, status: 'completed', result: { content: [], metadata: { todos: [{ status: 'pending' }] } },
+      })
+      assert.equal(syntheticCalls.length, 1)
+    } finally {
+      await pluginCleanup()
+      await cleanup()
+    }
+  })
+
+  it('a data condition is not applicable for a failed/errored tool call (no metadata read)', async () => {
+    const { pluginCleanup, syntheticCalls, emitToolEvent, cleanup } = await loadV2([
+      { id: 'r1', event: 'tool.execute.after', condition: { type: 'dataArrayNonEmpty', path: 'todos', tool: 'todowrite' }, instruction: 'do X' },
+    ])
+    try {
+      await emitToolEvent({
+        tool: 'todowrite', sessionID: 's1', agent: 'build', messageID: 'm1', id: 'call1',
+        input: {}, status: 'error', error: { message: 'boom' },
+      })
       assert.equal(syntheticCalls.length, 0)
     } finally {
       await pluginCleanup()
