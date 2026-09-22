@@ -11,18 +11,13 @@
 //   client.session.promptAsync             ctx.session.synthetic({sessionID, text, description, resume, metadata})
 //   client.app.log                         stderr only (Context.app has no log method)
 //
-// Key differences from V1 (see design.md D2-D8 for the full analysis):
-//   - V2 has no `todo.updated` event and no server-side todo-management
-//     tool at all (confirmed by exhaustively enumerating V2's built-in tool
-//     registrations, tag v2.0.6 -- there is nothing for any hook to observe
-//     todo state from). The 9 todo-derived condition types have no V2
-//     source and are logged as unsupported per-rule at load time
-//     (V2_UNSUPPORTED_CONDITION_TYPES / V2_UNSUPPORTED_EVENT_TYPES).
-//   - `toolName`/`toolNameIn` ARE supported on V2: `ctx.tool.hook`
-//     ("execute.after", callback)` (confirmed against the V2 source,
-//     packages/core/src/tool.ts and packages/plugin/src/promise/adapter.ts,
-//     tag v2.0.6) fires for every tool call with the tool name, session ID,
-//     and agent directly in the payload -- a second, independent event
+// Key differences from V1 (see design.md for the full analysis):
+//   - `toolName`/`toolNameIn`, and the generic `data*` condition vocabulary,
+//     are all evaluated against `ctx.tool.hook("execute.after", callback)`
+//     (confirmed against the V2 source, packages/core/src/tool.ts and
+//     packages/plugin/src/promise/adapter.ts, tag v2.0.6), which fires for
+//     every tool call with the tool name, session ID, agent, and result
+//     metadata directly in the payload -- a second, independent event
 //     intake path alongside ctx.event.subscribe().
 //   - messageFinished uses session.step.ended's data.finish, treating an
 //     error/failure finish as a non-match (V1 semantics: a *successful*
@@ -45,8 +40,7 @@ import {
   createSessionState,
   evaluate,
   buildFraming,
-  V2_UNSUPPORTED_CONDITION_TYPES,
-  V2_UNSUPPORTED_EVENT_TYPES,
+  validateRules,
 } from './core.js'
 
 const PLUGIN_NAME = 'opencode-auto-instruct'
@@ -62,9 +56,8 @@ function makeLogger() {
 /**
  * Normalizes a raw event from ctx.event.subscribe() into core.js's
  * NormalizedEvent shape. V2 events carry their payload under `event.data`,
- * in a richer envelope (design.md D1). Only `session.created` and
- * `session.step.ended` currently map to a `kind` this plugin acts on --
- * `todo.updated` has no V2 source at all (see V2_UNSUPPORTED_EVENT_TYPES).
+ * in a richer envelope. Only `session.created` and `session.step.ended`
+ * currently map to a `kind` this plugin acts on.
  */
 function normalize(event) {
   const data = event.data ?? {}
@@ -76,8 +69,8 @@ function normalize(event) {
       raw: event,
       sessionID,
       agentHint: data.agent ?? null,
-      todos: null,
       toolName: null,
+      toolMetadata: null,
       finish: null,
     }
   }
@@ -95,8 +88,8 @@ function normalize(event) {
       raw: event,
       sessionID,
       agentHint: null,
-      todos: null,
       toolName: null,
+      toolMetadata: null,
       finish: isFailure ? null : (finish ?? null),
     }
   }
@@ -106,8 +99,8 @@ function normalize(event) {
     raw: event,
     sessionID,
     agentHint: null,
-    todos: null,
     toolName: null,
+    toolMetadata: null,
     finish: null,
   }
 }
@@ -117,6 +110,9 @@ function normalize(event) {
  * NormalizedEvent shape. This is a separate intake path from
  * ctx.event.subscribe() -- the hook fires for every tool invocation and
  * carries the tool name directly, unlike anything in the event stream.
+ * `toolMetadata` is read from `result.metadata` only when the call
+ * succeeded (`status: "completed"`) -- never from `result.output`/content,
+ * and never for a failed/errored call (design.md D3).
  */
 function normalizeToolEvent(toolEvent) {
   return {
@@ -124,8 +120,8 @@ function normalizeToolEvent(toolEvent) {
     raw: toolEvent,
     sessionID: toolEvent.sessionID ?? null,
     agentHint: toolEvent.agent ?? null,
-    todos: null,
     toolName: toolEvent.tool ?? null,
+    toolMetadata: toolEvent.status === 'completed' ? (toolEvent.result?.metadata ?? null) : null,
     finish: null,
   }
 }
@@ -136,31 +132,7 @@ export default Plugin.define({
     const log = makeLogger()
     const { rules, debug } = await loadRules(log, ctx.options ?? {})
     log(`loaded ${rules.length} rule(s)${debug ? ' (debug mode ON)' : ''}`)
-
-    // Warn once per rule at load time for any condition type -- OR any
-    // trigger event type -- with no V2 source, rather than silently never
-    // firing. A rule with no condition (or an unrelated one) bound to an
-    // unsupported event is just as dead as one with an unsupported
-    // condition type, and was the specific "loads cleanly, logs nothing,
-    // never fires" failure mode design.md section 2 calls out as the worst
-    // outcome available.
-    for (const rule of rules) {
-      const condType = rule.condition?.type
-      if (condType && V2_UNSUPPORTED_CONDITION_TYPES.has(condType)) {
-        log(
-          `rule=${rule.id ?? '(unnamed)'} uses condition type "${condType}", which has no V2 event ` +
-          `or tool-call source as of @opencode/cli 2.0.6 (no server-side todo-management tool exists) -- ` +
-          `this rule will never match on this runtime`,
-          null, 'warn',
-        )
-      } else if (V2_UNSUPPORTED_EVENT_TYPES.has(rule.event)) {
-        log(
-          `rule=${rule.id ?? '(unnamed)'} targets event "${rule.event}", which has no V2 event ` +
-          `source as of @opencode/cli 2.0.6 -- this rule will never match on this runtime`,
-          null, 'warn',
-        )
-      }
-    }
+    validateRules(rules, log)
 
     const sessionAgents = new Map()
     const sessionStates = new Map()

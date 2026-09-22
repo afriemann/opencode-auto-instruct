@@ -9,11 +9,16 @@ import {
   loadRules,
   matchesAgents,
   checkCondition,
+  validateRules,
+  resolvePath,
+  deepEqual,
+  summarizeKeyPaths,
   buildFraming,
   evaluate,
   createSessionState,
   resolveConfigPath,
-  V2_UNSUPPORTED_CONDITION_TYPES,
+  REMOVED_LEGACY_CONDITION_TYPES,
+  REMOVED_LEGACY_EVENT_TYPES,
 } from '../src/core.js'
 
 function makeLog() {
@@ -132,81 +137,84 @@ describe('matchesAgents', () => {
   })
 })
 
+describe('resolvePath', () => {
+  it('resolves nested object keys', () => {
+    const { ok, value } = resolvePath({ counts: { completed: 2 } }, 'counts.completed')
+    assert.equal(ok, true)
+    assert.equal(value, 2)
+  })
+
+  it('resolves numeric array indices', () => {
+    const { ok, value } = resolvePath({ todos: [{ status: 'pending' }, { status: 'completed' }] }, 'todos.1.status')
+    assert.equal(ok, true)
+    assert.equal(value, 'completed')
+  })
+
+  it('empty path resolves to the root value', () => {
+    const { ok, value } = resolvePath({ a: 1 }, '')
+    assert.equal(ok, true)
+    assert.deepEqual(value, { a: 1 })
+  })
+
+  it('an absent segment is not applicable', () => {
+    assert.equal(resolvePath({ a: 1 }, 'b').ok, false)
+    assert.equal(resolvePath(null, 'a').ok, false)
+  })
+
+  it('rejects __proto__, constructor, and prototype segments', () => {
+    assert.equal(resolvePath({}, '__proto__').ok, false)
+    assert.equal(resolvePath({}, 'constructor').ok, false)
+    assert.equal(resolvePath({}, 'prototype').ok, false)
+    assert.equal(resolvePath({}, 'a.__proto__.polluted').ok, false)
+  })
+})
+
+describe('deepEqual', () => {
+  it('compares primitives by strict equality', () => {
+    assert.equal(deepEqual(1, 1), true)
+    assert.equal(deepEqual(1, '1'), false)
+    assert.equal(deepEqual(null, null), true)
+    assert.equal(deepEqual(null, undefined), false)
+  })
+
+  it('compares objects by value, independent of key order', () => {
+    assert.equal(deepEqual({ a: 1, b: 2 }, { b: 2, a: 1 }), true)
+    assert.equal(deepEqual({ a: 1 }, { a: 2 }), false)
+  })
+
+  it('compares arrays recursively', () => {
+    assert.equal(deepEqual([1, { a: 2 }], [1, { a: 2 }]), true)
+    assert.equal(deepEqual([1, 2], [1, 2, 3]), false)
+  })
+})
+
+describe('summarizeKeyPaths', () => {
+  it('summarizes key paths with types, one level of nesting, and array lengths', () => {
+    const summary = summarizeKeyPaths({ todos: [1, 2, 3], counts: { completed: 2 }, note: 'secret file contents' })
+    assert.ok(summary.includes('todos:array(3)'))
+    assert.ok(summary.includes('counts:object'))
+    assert.ok(summary.includes('counts.completed:number'))
+    assert.ok(summary.includes('note:string'))
+  })
+
+  it('never includes a resolved value in the summary', () => {
+    const summary = summarizeKeyPaths({ secret: 'super-secret-token-value' })
+    assert.ok(!summary.some((s) => s.includes('super-secret-token-value')))
+  })
+
+  it('returns an empty array for null or non-object input', () => {
+    assert.deepEqual(summarizeKeyPaths(null), [])
+    assert.deepEqual(summarizeKeyPaths('x'), [])
+  })
+})
+
 describe('checkCondition', () => {
   const log = makeLog()
 
   it('no condition always matches', () => {
-    const { result } = checkCondition({}, {}, createSessionState(), log)
+    const { result, applicable } = checkCondition({}, {}, createSessionState(), log)
     assert.equal(result, true)
-  })
-
-  it('allTodosComplete matches when all todos are completed and non-empty', () => {
-    const nev = { todos: [{ status: 'completed' }, { status: 'completed' }] }
-    const { result } = checkCondition({ condition: { type: 'allTodosComplete' } }, nev, createSessionState(), log)
-    assert.equal(result, true)
-  })
-
-  it('allTodosComplete is false on an empty list ("all of none")', () => {
-    const nev = { todos: [] }
-    const { result } = checkCondition({ condition: { type: 'allTodosComplete' } }, nev, createSessionState(), log)
-    assert.equal(result, false)
-  })
-
-  it('anyTodosComplete matches when at least one todo is completed', () => {
-    const nev = { todos: [{ status: 'pending' }, { status: 'completed' }] }
-    const { result } = checkCondition({ condition: { type: 'anyTodosComplete' } }, nev, createSessionState(), log)
-    assert.equal(result, true)
-  })
-
-  it('noTodosInProgress matches when nothing is in_progress', () => {
-    const nev = { todos: [{ status: 'completed' }] }
-    const { result } = checkCondition({ condition: { type: 'noTodosInProgress' } }, nev, createSessionState(), log)
-    assert.equal(result, true)
-  })
-
-  it('hasTodos matches on a non-empty list', () => {
-    const { result: yes } = checkCondition({ condition: { type: 'hasTodos' } }, { todos: [{ status: 'pending' }] }, createSessionState(), log)
-    const { result: no } = checkCondition({ condition: { type: 'hasTodos' } }, { todos: [] }, createSessionState(), log)
-    assert.equal(yes, true)
-    assert.equal(no, false)
-  })
-
-  it('todoListCreated matches on empty-to-non-empty transition', () => {
-    const state = createSessionState()
-    state.prevTodos = []
-    const { result } = checkCondition({ condition: { type: 'todoListCreated' } }, { todos: [{ status: 'pending' }] }, state, log)
-    assert.equal(result, true)
-  })
-
-  it('todoListCleared matches on non-empty-to-empty transition', () => {
-    const state = createSessionState()
-    state.prevTodos = [{ status: 'completed' }]
-    const { result } = checkCondition({ condition: { type: 'todoListCleared' } }, { todos: [] }, state, log)
-    assert.equal(result, true)
-  })
-
-  it('firstTodoStarted matches on the first transition to in_progress', () => {
-    const state = createSessionState()
-    state.prevTodos = [{ status: 'pending' }]
-    const { result } = checkCondition({ condition: { type: 'firstTodoStarted' } }, { todos: [{ status: 'in_progress' }] }, state, log)
-    assert.equal(result, true)
-  })
-
-  it('allTodosCompleteOnce fires once, then not again for the same session', () => {
-    const state = createSessionState()
-    const nev = { todos: [{ status: 'completed' }] }
-    const first = checkCondition({ condition: { type: 'allTodosCompleteOnce' } }, nev, state, log)
-    assert.equal(first.result, true)
-    state.allTodosCompleteOnceFired = true // caller (evaluate) commits this post-loop
-    const second = checkCondition({ condition: { type: 'allTodosCompleteOnce' } }, nev, state, log)
-    assert.equal(second.result, false)
-  })
-
-  it('todoCountAtLeast defaults to 1 when count is missing or non-numeric', () => {
-    const { result: withOne } = checkCondition({ condition: { type: 'todoCountAtLeast' } }, { todos: [{ status: 'pending' }] }, createSessionState(), log)
-    assert.equal(withOne, true)
-    const { result: withZero } = checkCondition({ condition: { type: 'todoCountAtLeast' } }, { todos: [] }, createSessionState(), log)
-    assert.equal(withZero, false)
+    assert.equal(applicable, true)
   })
 
   it('messageFinished matches when finish is truthy', () => {
@@ -234,9 +242,180 @@ describe('checkCondition', () => {
 
   it('unknown condition type warns and does not match', () => {
     const localLog = makeLog()
-    const { result } = checkCondition({ condition: { type: 'notReal' } }, {}, createSessionState(), localLog)
+    const { result, applicable } = checkCondition({ condition: { type: 'notReal' } }, {}, createSessionState(), localLog)
     assert.equal(result, false)
+    assert.equal(applicable, true)
     assert.equal(localLog.calls[0].level, 'warn')
+  })
+
+  describe('data-predicate conditions', () => {
+    const metaEvent = (toolMetadata, toolName = 'todowrite') => ({ toolMetadata, toolName })
+
+    it('dataArrayNonEmpty matches a non-empty resolved array', () => {
+      const nonEmpty = checkCondition({ condition: { type: 'dataArrayNonEmpty', path: 'todos' } }, metaEvent({ todos: [{ status: 'pending' }] }), createSessionState(), log)
+      assert.equal(nonEmpty.result, true)
+      const empty = checkCondition({ condition: { type: 'dataArrayEmpty', path: 'todos' } }, metaEvent({ todos: [] }), createSessionState(), log)
+      assert.equal(empty.result, true)
+    })
+
+    it('dataArrayLengthAtLeast matches a length threshold', () => {
+      const { result } = checkCondition(
+        { condition: { type: 'dataArrayLengthAtLeast', path: 'todos', count: 2 } },
+        metaEvent({ todos: [{ status: 'pending' }, { status: 'completed' }] }),
+        createSessionState(), log,
+      )
+      assert.equal(result, true)
+    })
+
+    it('dataArrayAllMatch matches when every element satisfies the field comparison', () => {
+      const { result } = checkCondition(
+        { condition: { type: 'dataArrayAllMatch', path: 'todos', field: 'status', value: 'completed' } },
+        metaEvent({ todos: [{ status: 'completed' }, { status: 'completed' }] }),
+        createSessionState(), log,
+      )
+      assert.equal(result, true)
+    })
+
+    it('dataArrayAnyMatch matches when at least one element satisfies the field comparison', () => {
+      const { result } = checkCondition(
+        { condition: { type: 'dataArrayAnyMatch', path: 'todos', field: 'status', value: 'in_progress' } },
+        metaEvent({ todos: [{ status: 'pending' }, { status: 'in_progress' }] }),
+        createSessionState(), log,
+      )
+      assert.equal(result, true)
+    })
+
+    it('dataArrayNoneMatch matches when no element satisfies the field comparison', () => {
+      const { result } = checkCondition(
+        { condition: { type: 'dataArrayNoneMatch', path: 'todos', field: 'status', value: 'pending' } },
+        metaEvent({ todos: [{ status: 'completed' }, { status: 'completed' }] }),
+        createSessionState(), log,
+      )
+      assert.equal(result, true)
+    })
+
+    it('dataArrayAllMatch field:"" compares array elements directly', () => {
+      const { result } = checkCondition(
+        { condition: { type: 'dataArrayAllMatch', path: 'tags', field: '', value: 'x' } },
+        metaEvent({ tags: ['x', 'x'] }),
+        createSessionState(), log,
+      )
+      assert.equal(result, true)
+    })
+
+    it('dataEquals uses deep equality independent of key order', () => {
+      const { result } = checkCondition(
+        { condition: { type: 'dataEquals', path: 'counts', value: { pending: 0, completed: 2 } } },
+        metaEvent({ counts: { completed: 2, pending: 0 } }),
+        createSessionState(), log,
+      )
+      assert.equal(result, true)
+    })
+
+    it('dataNumberAtLeast matches a numeric threshold', () => {
+      const { result } = checkCondition(
+        { condition: { type: 'dataNumberAtLeast', path: 'counts.completed', value: 3 } },
+        metaEvent({ counts: { completed: 3 } }),
+        createSessionState(), log,
+      )
+      assert.equal(result, true)
+    })
+
+    it('dataNumberAtLeast is not applicable for a non-numeric resolved value', () => {
+      const { applicable } = checkCondition(
+        { condition: { type: 'dataNumberAtLeast', path: 'counts.completed', value: 3 } },
+        metaEvent({ counts: { completed: 'three' } }),
+        createSessionState(), log,
+      )
+      assert.equal(applicable, false)
+    })
+
+    it('an unresolvable path is not applicable, not false', () => {
+      const { result, applicable } = checkCondition(
+        { condition: { type: 'dataArrayNonEmpty', path: 'todos' } },
+        metaEvent({}, 'bash'),
+        createSessionState(), log,
+      )
+      assert.equal(applicable, false)
+      assert.equal(result, false)
+    })
+
+    it('null toolMetadata (e.g. a failed tool call) is not applicable', () => {
+      const { applicable } = checkCondition(
+        { condition: { type: 'dataArrayNonEmpty', path: 'todos' } },
+        metaEvent(null),
+        createSessionState(), log,
+      )
+      assert.equal(applicable, false)
+    })
+
+    it("tool scoping makes an unrelated tool's completion not applicable", () => {
+      const { applicable } = checkCondition(
+        { condition: { type: 'dataArrayNonEmpty', path: 'todos', tool: 'todowrite' } },
+        metaEvent({ todos: [{ status: 'pending' }] }, 'bash'),
+        createSessionState(), log,
+      )
+      assert.equal(applicable, false)
+    })
+
+    it('toolIn scoping accepts any listed tool', () => {
+      const { applicable, result } = checkCondition(
+        { condition: { type: 'dataArrayNonEmpty', path: 'todos', toolIn: ['todowrite', 'todoread'] } },
+        metaEvent({ todos: [{ status: 'pending' }] }, 'todoread'),
+        createSessionState(), log,
+      )
+      assert.equal(applicable, true)
+      assert.equal(result, true)
+    })
+  })
+})
+
+describe('validateRules', () => {
+  it('warns naming a removed legacy condition type, distinct from the generic unknown-type warning', () => {
+    const log = makeLog()
+    validateRules([{ id: 'r1', event: 'tool.execute.after', condition: { type: 'allTodosComplete' } }], log)
+    assert.equal(log.calls.length, 1)
+    assert.match(log.calls[0].msg, /"allTodosComplete"/)
+    assert.match(log.calls[0].msg, /removed/)
+  })
+
+  it('warns for a rule targeting the removed todo.updated event', () => {
+    const log = makeLog()
+    validateRules([{ id: 'r1', event: 'todo.updated' }], log)
+    assert.equal(log.calls.length, 1)
+    assert.match(log.calls[0].msg, /"todo\.updated"/)
+    assert.match(log.calls[0].msg, /no longer emitted/)
+  })
+
+  it('warns exactly once when both a removed condition type and the removed event apply', () => {
+    const log = makeLog()
+    validateRules([{ id: 'r1', event: 'todo.updated', condition: { type: 'allTodosComplete' } }], log)
+    assert.equal(log.calls.length, 1)
+  })
+
+  it('warns for once/edge without a stable id', () => {
+    const log = makeLog()
+    validateRules([{ event: 'tool.execute.after', once: true }], log)
+    assert.equal(log.calls.length, 1)
+    assert.match(log.calls[0].msg, /once\/edge/)
+  })
+
+  it('warns for a malformed data condition (missing path)', () => {
+    const log = makeLog()
+    validateRules([{ id: 'r1', event: 'tool.execute.after', condition: { type: 'dataArrayNonEmpty' } }], log)
+    assert.equal(log.calls.length, 1)
+    assert.match(log.calls[0].msg, /"path"/)
+  })
+
+  it('does not warn for a fully-valid rule', () => {
+    const log = makeLog()
+    validateRules([{ id: 'r1', event: 'tool.execute.after', condition: { type: 'toolName', tool: 'bash' } }], log)
+    assert.equal(log.calls.length, 0)
+  })
+
+  it('exports the removed legacy type/event sets', () => {
+    assert.equal(REMOVED_LEGACY_CONDITION_TYPES.size, 9)
+    assert.equal(REMOVED_LEGACY_EVENT_TYPES.has('todo.updated'), true)
   })
 })
 
@@ -273,52 +452,105 @@ describe('evaluate', () => {
     assert.equal(decisions.length, 0)
   })
 
-  it('two transition rules in one event see the same prev/current pair', () => {
-    const rules = [
-      { id: 'created', event: 'todo.updated', condition: { type: 'todoListCreated' }, instruction: 'i1' },
-      { id: 'cleared', event: 'todo.updated', condition: { type: 'todoListCleared' }, instruction: 'i2' },
-    ]
-    const state = createSessionState()
-    state.prevTodos = [{ status: 'completed' }]
-    // Current event: list went from non-empty to empty AND is being compared
-    // fresh for both rules -- todoListCreated must NOT match (current is
-    // empty, not created), todoListCleared MUST match.
-    const nev = { kind: 'todo.updated', sessionID: 's1', todos: [] }
-    const decisions = evaluate(rules, nev, 'build', state, makeLog(), false)
-    assert.deepEqual(decisions.map(d => d.rule.id), ['cleared'])
-  })
-
-  it('prevTodos and allTodosCompleteOnceFired commit only after the full rule pass', () => {
-    const rules = [{ id: 'r1', event: 'todo.updated', condition: { type: 'allTodosCompleteOnce' }, instruction: 'i1' }]
-    const state = createSessionState()
-    const nev = { kind: 'todo.updated', sessionID: 's1', todos: [{ status: 'completed' }] }
-    const first = evaluate(rules, nev, 'build', state, makeLog(), false)
-    assert.equal(first.length, 1, 'fires the first time')
-    assert.equal(state.allTodosCompleteOnceFired, true, 'committed after the pass')
-    const second = evaluate(rules, nev, 'build', state, makeLog(), false)
-    assert.equal(second.length, 0, 'does not fire again')
-  })
-
   it('an unresolved agent fails a specific agent filter', () => {
     const rules = [{ id: 'r1', event: 'session.created', agents: 'build', instruction: 'i1' }]
     const nev = { kind: 'session.created', sessionID: 's1' }
     const decisions = evaluate(rules, nev, null, createSessionState(), makeLog(), false)
     assert.equal(decisions.length, 0)
   })
-})
 
-describe('V2_UNSUPPORTED_CONDITION_TYPES', () => {
-  it('lists exactly the 9 todo-derived types (toolName/toolNameIn are supported via ctx.tool.hook)', () => {
-    assert.deepEqual(
-      [...V2_UNSUPPORTED_CONDITION_TYPES].sort(),
-      [
-        'allTodosComplete', 'allTodosCompleteOnce', 'anyTodosComplete',
-        'firstTodoStarted', 'hasTodos', 'noTodosInProgress', 'todoCountAtLeast',
-        'todoListCleared', 'todoListCreated',
-      ].sort(),
-    )
-    assert.equal(V2_UNSUPPORTED_CONDITION_TYPES.has('messageFinished'), false)
-    assert.equal(V2_UNSUPPORTED_CONDITION_TYPES.has('toolName'), false)
-    assert.equal(V2_UNSUPPORTED_CONDITION_TYPES.has('toolNameIn'), false)
+  it('a not-applicable condition does not fire and does not update once/edge state', () => {
+    const rules = [{
+      id: 'r1', event: 'tool.execute.after', instruction: 'i1',
+      condition: { type: 'dataArrayNonEmpty', path: 'todos' }, edge: 'rise',
+    }]
+    const state = createSessionState()
+    const nev = { kind: 'tool.execute.after', sessionID: 's1', toolName: 'bash', toolMetadata: {} }
+    const decisions = evaluate(rules, nev, 'build', state, makeLog(), false)
+    assert.equal(decisions.length, 0)
+    assert.equal(state.modifierState.has('r1'), false)
+  })
+
+  describe('once modifier', () => {
+    it('once fires only the first time', () => {
+      const rules = [{
+        id: 'r1', event: 'tool.execute.after', instruction: 'i1', once: true,
+        condition: { type: 'dataArrayNonEmpty', path: 'todos' },
+      }]
+      const state = createSessionState()
+      const nev = { kind: 'tool.execute.after', sessionID: 's1', toolName: 'todowrite', toolMetadata: { todos: [{ status: 'pending' }] } }
+      const first = evaluate(rules, nev, 'build', state, makeLog(), false)
+      assert.equal(first.length, 1)
+      const second = evaluate(rules, nev, 'build', state, makeLog(), false)
+      assert.equal(second.length, 0)
+    })
+
+    it('is ignored (rule behaves unmodified) when the rule has no id', () => {
+      const rules = [{
+        event: 'tool.execute.after', instruction: 'i1', once: true,
+        condition: { type: 'dataArrayNonEmpty', path: 'todos' },
+      }]
+      const state = createSessionState()
+      const nev = { kind: 'tool.execute.after', sessionID: 's1', toolName: 'todowrite', toolMetadata: { todos: [{ status: 'pending' }] } }
+      const first = evaluate(rules, nev, 'build', state, makeLog(), false)
+      const second = evaluate(rules, nev, 'build', state, makeLog(), false)
+      assert.equal(first.length, 1)
+      assert.equal(second.length, 1, 'without an id, once has no effect -- the rule fires every time')
+    })
+
+    it('condition-less rule with once fires once per session', () => {
+      const rules = [{ id: 'r3', event: 'tool.execute.after', instruction: 'i1', once: true }]
+      const state = createSessionState()
+      const nev = { kind: 'tool.execute.after', sessionID: 's1', toolName: 'bash', toolMetadata: null }
+      const first = evaluate(rules, nev, 'build', state, makeLog(), false)
+      const second = evaluate(rules, nev, 'build', state, makeLog(), false)
+      assert.equal(first.length, 1)
+      assert.equal(second.length, 0)
+    })
+  })
+
+  describe('edge modifier', () => {
+    it('edge rise fires only on a false-to-true transition', () => {
+      const rules = [{
+        id: 'r2', event: 'tool.execute.after', instruction: 'i1', edge: 'rise',
+        condition: { type: 'dataArrayNonEmpty', path: 'todos' },
+      }]
+      const state = createSessionState()
+      const empty = { kind: 'tool.execute.after', sessionID: 's1', toolName: 'todowrite', toolMetadata: { todos: [] } }
+      const nonEmpty = { kind: 'tool.execute.after', sessionID: 's1', toolName: 'todowrite', toolMetadata: { todos: [{ status: 'pending' }] } }
+      assert.equal(evaluate(rules, empty, 'build', state, makeLog(), false).length, 0)
+      assert.equal(evaluate(rules, nonEmpty, 'build', state, makeLog(), false).length, 1, 'rises on first non-empty')
+      assert.equal(evaluate(rules, nonEmpty, 'build', state, makeLog(), false).length, 0, 'does not re-fire while still non-empty')
+    })
+
+    it('fall fires only on a true-to-false transition', () => {
+      const rules = [{
+        id: 'r2', event: 'tool.execute.after', instruction: 'i1', edge: 'fall',
+        condition: { type: 'dataArrayNonEmpty', path: 'todos' },
+      }]
+      const state = createSessionState()
+      state.modifierState.set('r2', { lastMatch: true, fired: false })
+      const empty = { kind: 'tool.execute.after', sessionID: 's1', toolName: 'todowrite', toolMetadata: { todos: [] } }
+      assert.equal(evaluate(rules, empty, 'build', state, makeLog(), false).length, 1)
+    })
+
+    it('condition-less rule with edge rise fires only on the first event', () => {
+      const rules = [{ id: 'r4', event: 'tool.execute.after', instruction: 'i1', edge: 'rise' }]
+      const state = createSessionState()
+      const nev = { kind: 'tool.execute.after', sessionID: 's1', toolName: 'bash', toolMetadata: null }
+      assert.equal(evaluate(rules, nev, 'build', state, makeLog(), false).length, 1)
+      assert.equal(evaluate(rules, nev, 'build', state, makeLog(), false).length, 0)
+    })
+  })
+
+  it('Transition conditions see a consistent prev/current pair across rules in one event', () => {
+    const rules = [
+      { id: 'ra', event: 'tool.execute.after', instruction: 'i1', edge: 'rise', condition: { type: 'toolName', tool: 'todowrite' } },
+      { id: 'rb', event: 'tool.execute.after', instruction: 'i2', edge: 'fall', condition: { type: 'toolName', tool: 'todowrite' } },
+    ]
+    const state = createSessionState()
+    const nev = { kind: 'tool.execute.after', sessionID: 's1', toolName: 'todowrite', toolMetadata: {} }
+    const decisions = evaluate(rules, nev, 'build', state, makeLog(), false)
+    assert.deepEqual(decisions.map(d => d.rule.id).sort(), ['ra'])
   })
 })

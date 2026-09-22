@@ -7,12 +7,16 @@ opencode plugin that sends configurable instructions as real conversation messag
 Symlink into the global opencode plugins directory:
 
 ```bash
-mkdir -p ~/git/opencode-auto-instruct/node_modules/@opencode-ai
-ln -s ~/.config/opencode/node_modules/@opencode-ai/plugin \
-      ~/git/opencode-auto-instruct/node_modules/@opencode-ai/plugin
-ln -s ~/git/opencode-auto-instruct/src/index.js \
+# V1 (`opencode-ai`/`@opencode-ai/plugin`)
+ln -s ~/git/opencode-auto-instruct/src/plugin.v1.js \
+      ~/.config/opencode/plugins/opencode-auto-instruct.js
+
+# V2 (`@opencode/cli`/`@opencode/plugin`)
+ln -s ~/git/opencode-auto-instruct/src/plugin.v2.js \
       ~/.config/opencode/plugins/opencode-auto-instruct.js
 ```
+
+Or import via the package's `exports` map (`.`/`./v1` → `src/plugin.v1.js`, `./v2` → `src/plugin.v2.js`).
 
 ## Configuration
 
@@ -23,9 +27,10 @@ Create `~/.config/opencode/auto-instruct.json`:
   "rules": [
     {
       "id":          "optional-identifier",
-      "event":       "todo.updated",
+      "event":       "tool.execute.after",
       "agents":      ["engineer", "agent-engineer"],
-      "condition":   { "type": "allTodosComplete" },
+      "condition":   { "type": "dataArrayAllMatch", "path": "todos", "field": "status", "value": "completed", "tool": "todowrite" },
+      "once":        true,
       "instruction": "All your todos are marked complete. Before finishing, run through your quality checklist..."
     }
   ]
@@ -36,23 +41,24 @@ Create `~/.config/opencode/auto-instruct.json`:
 
 | Field           | Type                      | Required | Description |
 |-----------------|---------------------------|----------|-------------|
-| `id`            | `string`                  | no       | Identifier shown in logs |
+| `id`            | `string`                  | no       | Identifier shown in logs. **Required** if `once` or `edge` is set (see below) |
 | `event`         | `string`                  | **yes**  | opencode event type to listen on |
 | `agents`        | `string \| string[]`      | no       | Agent name(s) to match, or `"*"`. Absent = match all agents |
 | `condition`     | `{ type, ...opts }`       | no       | Additional condition on the event. Absent = always match |
+| `once`          | `boolean`                 | no       | Fire at most once per session (requires `id`) |
+| `edge`          | `"rise" \| "fall"`        | no       | Fire only on a false→true (`rise`) or true→false (`fall`) transition of the condition (requires `id`) |
 | `instruction`   | `string`                  | **yes**  | Text sent as a new conversation message to the agent |
 | `switchToAgent` | `string`                  | no       | When set, switches the session to this agent before delivering the instruction. The new agent receives the instruction and responds under its own system prompt. The full conversation history is preserved — this is a mid-session handoff, not a fresh context. **V1/V2 divergence**: on V1 this override is scoped to the one delivery only, reverting afterward; on V2 it is a **persistent, session-level** switch — the session stays on the new agent for all subsequent turns. This makes V2 the better fit for a durable handoff (see the "Hand off to a different agent when work is done" example below); V1's per-delivery scoping is better suited to a one-off aside. See `docs/v2-compat-audit.md`. |
 | `hidden`        | `boolean`                 | no       | When `true`, the instruction text is sent to the agent only — hidden from the user in the UI (default: `false`) |
 | `noReply`       | `boolean`                 | no       | When `true`, the instruction is injected without triggering an agent response turn (default: `false`) |
 
 > **V2 support**: this plugin also ships a V2 adapter (`opencode-auto-instruct/v2`,
-> for `@opencode/cli`/`@opencode/plugin`). **Current limitation**: V2's event
-> vocabulary has no `todo.updated`, `message.updated`, or `tool.execute.after`
-> event, so the `todo.updated`-condition and `tool*`-condition rule types
-> below currently never match on V2 — the plugin logs a one-time warning per
-> affected rule at load. Rules using `event: "session.created"` (or another
-> non-todo/tool event) with `messageFinished` or no condition are unaffected.
-> See `docs/v2-compat-audit.md` for the full mapping and rationale.
+> for `@opencode/cli`/`@opencode/plugin`). The condition vocabulary below is
+> fully supported on both runtimes: `tool.execute.after` is a synthetic,
+> runtime-neutral event emitted identically on V1 (from `message.part.updated`)
+> and V2 (from `ctx.tool.hook('execute.after', ...)`), so one rule config works
+> unchanged on either host. See `docs/v2-compat-audit.md` for the runtime
+> mapping.
 
 ### Supported events
 
@@ -60,36 +66,20 @@ Any opencode event type works. Useful ones:
 
 | Event                | Fired when |
 |----------------------|------------|
-| `todo.updated`       | Agent updates its todo list |
 | `session.idle`       | Agent finishes a turn and goes idle |
 | `session.created`    | A new agent session starts |
 | `message.updated`    | An agent message is updated |
-| `tool.execute.after` | A tool call completes |
+| `tool.execute.after` | A tool call completes (synthetic, runtime-neutral — see above) |
 | `file.edited`        | The agent edits a file |
 
 ### Conditions
 
-Conditions filter events beyond just the event type.
-
-#### `todo.updated` conditions
-
-| Condition type         | Matches when | Notes |
-|------------------------|--------------|-------|
-| `allTodosComplete`     | All todos have status `"completed"` | Re-fires on every update while all todos remain complete |
-| `allTodosCompleteOnce` | All todos have status `"completed"` | Fires **at most once per session** — use instead of `allTodosComplete` to avoid repeated triggers |
-| `anyTodosComplete`     | At least one todo has status `"completed"` | |
-| `noTodosInProgress`    | No todo has status `"in_progress"` | |
-| `hasTodos`             | Todo list is non-empty | Re-fires on every update while the list is non-empty |
-| `todoListCreated`      | List transitions from empty → non-empty | Fires **once per session** on first todo creation |
-| `todoListCleared`      | List transitions from non-empty → empty | Fires when the agent wipes all todos |
-| `firstTodoStarted`     | First todo transitions to `in_progress` | Fires **once per session** when work begins |
-| `todoCountAtLeast`     | List has `condition.count` or more items | See options below |
-
-**`todoCountAtLeast` options:**
-
-```json
-{ "type": "todoCountAtLeast", "count": 5 }
-```
+Conditions filter events beyond just the event type. The plugin has **no
+built-in knowledge of any specific tool** — every condition below operates
+generically on whatever structured metadata a tool's result carries. To
+condition on a specific tool's data (e.g. a todo-management tool's todo
+list), point a `data*` condition at the dot-path within that tool's own
+result metadata, and scope it with `tool`/`toolIn` if needed.
 
 #### `message.updated` conditions
 
@@ -107,16 +97,91 @@ Conditions filter events beyond just the event type.
 **`toolName` options:**
 
 ```json
-{ "type": "toolName", "tool": "todowrite" }
+{ "type": "toolName", "tool": "bash" }
 ```
 
 **`toolNameIn` options:**
 
 ```json
-{ "type": "toolNameIn", "tools": ["todowrite", "bash"] }
+{ "type": "toolNameIn", "tools": ["bash", "todowrite"] }
+```
+
+#### Tool-agnostic data conditions
+
+Every condition below resolves `path` (a dot-path, e.g. `"todos"` or
+`"counts.completed"`) against the completed tool call's own result
+metadata, and evaluates a predicate on the resolved value. If the path does
+not resolve — because the completed tool didn't emit that metadata, or an
+optional `tool`/`toolIn` scope doesn't match the event's tool — the
+condition is **not applicable**: it does not match, and it does not update
+`once`/`edge` tracking state. This makes every `data*` condition safe by
+default against unrelated tool completions, even without `tool`/`toolIn`.
+
+| Condition type | Required fields | Matches when |
+|-----------------|-----------------|--------------|
+| `dataArrayEmpty` | `path` | Resolved value is an array of length `0` |
+| `dataArrayNonEmpty` | `path` | Resolved value is an array of length `> 0` |
+| `dataArrayLengthAtLeast` | `path`, `count` | Resolved array's length `>= count` |
+| `dataArrayAllMatch` | `path`, `field`, `value` | Every element's `field` (a dot-path relative to the element; `""` compares the element itself) deep-equals `value` |
+| `dataArrayAnyMatch` | `path`, `field`, `value` | At least one element's `field` deep-equals `value` |
+| `dataArrayNoneMatch` | `path`, `field`, `value` | No element's `field` deep-equals `value` |
+| `dataEquals` | `path`, `value` | Resolved value deep-equals `value` (structural, key-order independent) |
+| `dataNumberAtLeast` | `path`, `value` | Resolved value is a number `>= value` |
+
+All eight types accept an optional `tool: string` or `toolIn: string[]`
+field, restricting the condition to event(s) whose tool name matches:
+
+```json
+{ "type": "dataArrayNonEmpty", "path": "todos", "tool": "todowrite" }
 ```
 
 `condition` is optional — omit it to match every occurrence of the event.
+
+### `once` and `edge` rule modifiers
+
+Both **require** the rule to declare a stable `id`; without one, the plugin
+logs a load-time warning and the modifier is ignored for that rule (the
+rule otherwise continues to work normally).
+
+- `once: true` — the rule fires at most once per session, tracked
+  independently per rule.
+- `edge: "rise"` — the rule fires only when its condition transitions from
+  not-matching to matching, compared against that rule's own previous
+  state (never a shared, cross-rule snapshot).
+- `edge: "fall"` — the mirror image: fires only on a matching→not-matching
+  transition.
+
+A rule with no `condition` (always-true) combined with `once: true` fires
+on the first matching event in the session and never again; combined with
+`edge: "rise"`, it fires only on the very first such event.
+
+### Migrating from the removed todo-derived condition types
+
+The condition types `allTodosComplete`, `anyTodosComplete`,
+`noTodosInProgress`, `hasTodos`, `todoListCreated`, `todoListCleared`,
+`firstTodoStarted`, `allTodosCompleteOnce`, and `todoCountAtLeast` — along
+with the `todo.updated` event — were **removed** in favor of the
+tool-agnostic mechanism above. A rule using any of them logs a specific
+load-time warning naming the removed type/event. The table below maps each
+removed type to its replacement, assuming a todo-management tool whose
+result metadata is shaped `{ todos: [{ status }], counts: {...} }` — this
+shape is illustrative only; substitute your own tool's actual metadata
+schema.
+
+| Removed type | Replacement |
+|---|---|
+| `allTodosComplete` | `{ "type": "dataArrayAllMatch", "path": "todos", "field": "status", "value": "completed", "tool": "todowrite" }` |
+| `anyTodosComplete` | `{ "type": "dataArrayAnyMatch", "path": "todos", "field": "status", "value": "completed", "tool": "todowrite" }` |
+| `noTodosInProgress` | `{ "type": "dataArrayNoneMatch", "path": "todos", "field": "status", "value": "in_progress", "tool": "todowrite" }` |
+| `hasTodos` | `{ "type": "dataArrayNonEmpty", "path": "todos", "tool": "todowrite" }` |
+| `todoListCreated` | `{ "type": "dataArrayNonEmpty", "path": "todos", "tool": "todowrite" }` with `"edge": "rise"` |
+| `todoListCleared` | `{ "type": "dataArrayEmpty", "path": "todos", "tool": "todowrite" }` with `"edge": "rise"` |
+| `firstTodoStarted` | `{ "type": "dataArrayAnyMatch", "path": "todos", "field": "status", "value": "in_progress", "tool": "todowrite" }` with `"edge": "rise"` |
+| `allTodosCompleteOnce` | same condition as `allTodosComplete` above, with `"once": true` |
+| `todoCountAtLeast` | `{ "type": "dataNumberAtLeast", "path": "counts.total", "value": N, "tool": "todowrite" }` |
+
+Every rule using a replacement above also needs `"id"` set, since both
+`edge` and `once` require it.
 
 ### Agents filter
 
@@ -134,7 +199,7 @@ File rules are loaded first; any rules passed via `opencode.jsonc` plugin option
 
 ### Timing
 
-Instructions are injected on the **next LLM call** after the triggering event. For events like `todo.updated`, the agent almost always generates at least one more response (final summary, commit message, sign-off), so the instruction arrives at the right moment. Each instruction fires exactly once per trigger.
+Instructions are injected on the **next LLM call** after the triggering event. For events like `tool.execute.after`, the agent almost always generates at least one more response (final summary, commit message, sign-off), so the instruction arrives at the right moment. Each instruction fires exactly once per trigger.
 
 ## Examples
 
@@ -145,9 +210,10 @@ Instructions are injected on the **next LLM call** after the triggering event. F
   "rules": [
     {
       "id": "todo-list-created",
-      "event": "todo.updated",
+      "event": "tool.execute.after",
       "agents": ["engineer"],
-      "condition": { "type": "todoListCreated" },
+      "condition": { "type": "dataArrayNonEmpty", "path": "todos", "tool": "todowrite" },
+      "edge": "rise",
       "instruction": "You have just created a todo list. Keep it accurate as you work: mark items `in_progress` before starting, `completed` immediately after finishing, and add newly-discovered follow-ups. Only one item should be `in_progress` at a time."
     }
   ]
@@ -161,8 +227,9 @@ Instructions are injected on the **next LLM call** after the triggering event. F
   "rules": [
     {
       "id": "all-todos-done",
-      "event": "todo.updated",
-      "condition": { "type": "allTodosCompleteOnce" },
+      "event": "tool.execute.after",
+      "condition": { "type": "dataArrayAllMatch", "path": "todos", "field": "status", "value": "completed", "tool": "todowrite" },
+      "once": true,
       "instruction": "All todos are complete. Run the quality checklist before finishing: tests pass, linters clean, no secrets committed, git status is clean."
     }
   ]
@@ -193,9 +260,10 @@ When implementation todos are all complete, switch to the `code-reviewer` agent 
   "rules": [
     {
       "id": "review-on-completion",
-      "event": "todo.updated",
+      "event": "tool.execute.after",
       "agents": ["engineer"],
-      "condition": { "type": "allTodosCompleteOnce" },
+      "condition": { "type": "dataArrayAllMatch", "path": "todos", "field": "status", "value": "completed", "tool": "todowrite" },
+      "once": true,
       "switchToAgent": "code-reviewer",
       "hidden": true,
       "instruction": "Implementation is complete. Review the changes made in this session and report any blockers or warnings before the engineer commits."

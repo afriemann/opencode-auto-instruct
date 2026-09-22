@@ -16,78 +16,61 @@ runtime-agnostic rule/condition logic in `src/core.js`.
 ## What changed
 
 `src/core.js` holds all runtime-agnostic logic: rule loading/merging, agent
-filtering, all 12 condition evaluators, per-session state (todo-transition
-tracking, `allTodosCompleteOnce`), and instruction-framing text.
-`plugin.v1.js` and `plugin.v2.js` are thin adapters that normalize each
-host's raw event into a common shape and carry out delivery via their own
-SDK.
+filtering, a tool-agnostic condition vocabulary operating on a normalized
+event's `toolMetadata`, per-rule `once`/`edge` modifier state, and
+instruction-framing text. `plugin.v1.js` and `plugin.v2.js` are thin
+adapters that normalize each host's raw event into a common shape and
+carry out delivery via their own SDK.
 
 | Consumer wants | Import |
 |---|---|
 | V1 (`opencode-ai`/`@opencode-ai/plugin`, current default) | `opencode-auto-instruct` or `opencode-auto-instruct/v1` |
 | V2 (`@opencode/cli`/`@opencode/plugin`) | `opencode-auto-instruct/v2` |
 
-## Critical finding: V2 has no server-side todo-management tool (toolName/toolNameIn are supported)
+## Tool-completion events are now fully supported on both runtimes
 
-This is the most important fact about this port, corrected by a later
-architectural review that read the real V2 source tree directly (tag
-v2.0.6, not just the installed `@opencode/plugin` 2.0.4 type surface).
+A prior version of this document described the 9 todo-derived condition
+types as permanently unsupported on V2, since V2 has no server-side
+todo-management tool. That vocabulary has since been **removed entirely**
+(on both runtimes, not just V2) in favor of a generic, tool-agnostic
+mechanism: any condition can read structured metadata off **any** tool's
+completed result, via a dot-path and predicate configured in the rule
+itself — the plugin carries zero built-in knowledge of any specific tool.
+See `README.md`'s "Tool-agnostic data conditions" section for the schema,
+and its migration table for mapping old todo-derived rules onto the new
+mechanism (e.g. against a separate todo-management plugin that exposes its
+own `{todos, counts}`-shaped tool-result metadata).
 
-**`toolName`/`toolNameIn` are supported — the original "no tool-name-carrying
-event" conclusion was wrong.** V2 exposes a separate hook registration,
-`ctx.tool.hook("execute.after", callback)` (distinct from
-`ctx.event.subscribe()` — confirmed in `packages/core/src/tool.ts` and
-`packages/plugin/src/promise/adapter.ts`), that fires for every tool call,
-built-in or custom, with a stable payload: `{tool, sessionID, agent,
-messageID, id, input} & ({status:"completed", result}|{status:"error",
-error})`. The plugin now registers this hook alongside
-`ctx.event.subscribe()` and evaluates `toolName`/`toolNameIn` against it —
-these condition types match correctly on V2.
+**A genuine, pre-existing bug was fixed along the way.** V1's
+`toolName`/`toolNameIn` conditions matched on `event.type ===
+'tool.execute.after'`, but V1's generic event bus never emits an event with
+that literal type — that string only exists as a separate Hooks-object
+registration key (`Hooks['tool.execute.after']`), which the V1 adapter
+never registered. **These conditions had never actually fired on V1.**
+Fixed by normalizing from `message.part.updated` events instead, extracting
+a completed tool part (`part.type === 'tool'`, `part.state.status ===
+'completed'`) — the session ID for this specific event kind is read from
+`part.sessionID` (verified against the installed `@opencode-ai/sdk` types:
+the envelope itself carries no session ID for this event type), and
+`toolMetadata` from `part.state.metadata` (not the sibling, unrelated
+`part.metadata` field). A dedicated V1 fixture and test scenario prove the
+fix independently of the new data-condition mechanism (see Verification
+below).
 
-**The 9 todo-derived condition types remain unsupported — but for a
-different, now-confirmed reason.** Exhaustively enumerating V2's built-in
-tool registrations (every file under `packages/core/src/tool/plugin/`, plus
-a repo-wide grep for `todo` outside UI/test/i18n code) found **no
-server-side todo-management tool exists in V2 at all** as of tag v2.0.6.
-There is no `todowrite`/`todoread` tool, and no `todo.*` event either — so
-there is nothing for `ctx.tool.hook` (or any other mechanism) to observe
-todo state from. The original audit's reasoning ("no dedicated
-`todo.updated` event") was correct in outcome but incomplete in cause; this
-is the corrected, more fundamental reason.
-
-**Consequence:** of the 12 condition types this plugin supports, the 9
-todo-derived types (`allTodosComplete`, `anyTodosComplete`,
-`noTodosInProgress`, `hasTodos`, `todoListCreated`, `todoListCleared`,
-`firstTodoStarted`, `allTodosCompleteOnce`, `todoCountAtLeast`) have no V2
-source and never match on that runtime. `toolName`, `toolNameIn`, and
-`messageFinished` are all supported.
-
-**Current scope:** rules using any of the 9 todo-derived condition types
-are logged as unsupported, once per rule, at plugin load time on V2 — they
-never match, but the plugin does not go silently deaf about it:
-
-```
-[opencode-auto-instruct] [warn] rule=my-rule uses condition type "allTodosComplete",
-which has no V2 event or tool-call source as of @opencode/cli 2.0.6 (no
-server-side todo-management tool exists) -- this rule will never match on
-this runtime
-```
-
-**Recovering the 9 todo-derived types is out of this plugin's control**:
-it would require V2 itself to gain a server-side todo-management tool (or
-an equivalent event) for the plugin to hook into in the first place. There
-is nothing to synthesize this from today.
-
-If your rules rely only on `event: "session.created"`, `messageFinished`,
-`toolName`/`toolNameIn`, or no condition at all, they are unaffected — the
-migration below is fully in scope.
+On V2, `ctx.tool.hook('execute.after', ...)` — already used for
+`toolName`/`toolNameIn` — now also feeds the same `toolMetadata` field from
+`result.metadata` (only when `status === 'completed'`; `null` for a
+failed/errored call). Both runtimes therefore emit one synthetic,
+runtime-neutral `tool.execute.after` normalized event carrying `toolName`
+and `toolMetadata` identically, so one rule config is portable unchanged
+across both hosts.
 
 ## V1 → V2 API mapping
 
 | V1 | V2 | Note |
 |---|---|---|
 | `event` hook | `ctx.event.subscribe({signal})` | Async iterator over the full event stream; started detached (not awaited) in `setup()`. |
-| `tool.execute.after` event | `ctx.tool.hook("execute.after", callback)` | A **separate** hook registration, not part of `ctx.event.subscribe()`. Fires for every tool call with `{tool, sessionID, agent, messageID, id, input} & ({status:"completed", result}|{status:"error", error})`. Confirmed against V2 source (`packages/core/src/tool.ts`, `packages/plugin/src/promise/adapter.ts`, tag v2.0.6). This is what makes `toolName`/`toolNameIn` supported on V2. |
+| `tool.execute.after` (synthetic, both runtimes) | V1: `message.part.updated` with a completed `ToolPart`; V2: `ctx.tool.hook("execute.after", callback)` | A **separate** hook registration on V2, not part of `ctx.event.subscribe()`; fires for every tool call with `{tool, sessionID, agent, messageID, id, input} & ({status:"completed", result}|{status:"error", error})`. On V1, the equivalent signal is a `message.part.updated` event whose `part.type === "tool"` and `part.state.status === "completed"` — the envelope carries no session ID for this event kind, so it is read from `part.sessionID` instead. Both adapters normalize to the same synthetic `tool.execute.after` kind with `toolName` and `toolMetadata` populated identically. |
 | `client.session.get({path:{id}}) → res.data.agent` | `ctx.session.get({sessionID}) → res.agent` | **Unwrapped** on V2 — a real silent-failure risk if the V1 access pattern is copied naively. |
 | `client.session.promptAsync({system, noReply, agent, parts:[{text, synthetic}]})` | `ctx.session.synthetic({sessionID, text, description, resume, metadata})` | **Not** `ctx.session.prompt` — that method has no system/hidden/synthetic framing in its schema. `synthetic` is V2's documented mechanism for an out-of-band injected message. |
 | `body.noReply: true` | `resume: false` | Documented V2 equivalent: "schedule agent-loop execution unless resume is false." |
@@ -168,16 +151,22 @@ unaffected (the default path is unchanged).
 ## Verification
 
 - `test/core.test.js` (Layer 1): unit tests for rule loading, agent
-  filtering, all 12 condition types (including the edges the original
-  implementation encoded — `allTodosComplete` on an empty list, consistent
-  prev/current pairs across rules, `allTodosCompleteOnce`'s post-loop
-  commit), and instruction framing.
+  filtering, the tool-agnostic condition vocabulary (dot-path resolution,
+  deep equality, all eight `data*` predicate types, tri-state
+  not-applicable handling, `tool`/`toolIn` scoping), `once`/`edge` modifier
+  state (including the batch-commit invariant and the condition-less
+  cases), load-time validation (including the migration-specific
+  warnings), and instruction framing.
 - `test/plugin-conformance.test.js` (Layer 2): one shared suite exercised
   against a fake V1 host and a fake V2 `ctx` for runtime-neutral behavior,
   plus runtime-specific assertions (delivery shape, the unwrapped
-  `session.get`, the `switchAgent` guard, cleanup, and — since this
-  correction — a fake `ctx.tool.hook("execute.after", ...)` registration
-  exercising `toolName`/`toolNameIn` matching on V2).
+  `session.get`, the `switchAgent` guard, cleanup, a fake
+  `ctx.tool.hook("execute.after", ...)` registration exercising
+  `toolName`/`toolNameIn`/data conditions on V2, and — for the V1 bug fix —
+  fixtures built from the real `EventMessagePartUpdated`/`ToolPart`/
+  `ToolStateCompleted` shapes, including a dedicated scenario proving
+  `toolName` fires via the real `message.part.updated` path independently
+  of any data condition).
 - `npm run test:e2e` (Layer 3, not part of default `npm test`): the
   release-blocking gate described above, run against the real, pinned
   `@opencode/cli` binary with an isolated config path.

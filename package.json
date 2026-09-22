@@ -1,6 +1,6 @@
 {
   "name": "opencode-auto-instruct",
-  "version": "0.1.0",
+  "version": "0.2.0",
   "description": "opencode plugin — inject configurable instructions into agent sessions when events occur",
   "type": "module",
   "main": "src/plugin.v1.js",
