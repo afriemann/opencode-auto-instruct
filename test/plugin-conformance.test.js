@@ -229,6 +229,31 @@ describe('V1 adapter conformance', () => {
     }
   })
 
+  it('once state does not survive a restart on V1 (in-memory-only, unlike V2)', async () => {
+    const cleanup = await withConfigFile([
+      { id: 'r1', event: 'session.created', once: true, instruction: 'do X' },
+    ])
+    try {
+      // Two independent module loads simulate two separate process
+      // lifetimes against the same conversation session -- V1 has no
+      // storage surface, so each fresh load starts with an empty
+      // in-memory sessionStates map (spec: "V1 modifier state does not
+      // survive a restart").
+      const firstProcess = await import('../src/plugin.v1.js?t=' + Date.now() + '-a')
+      const firstHooks = await firstProcess.default({ client: makeFakeV1Client().client })
+      await firstHooks.event({ event: { type: 'session.created', properties: { info: { id: 's1', agent: 'build' } } } })
+
+      const secondProcess = await import('../src/plugin.v1.js?t=' + Date.now() + '-b')
+      const { client: secondClient, promptCalls: secondCalls } = makeFakeV1Client()
+      const secondHooks = await secondProcess.default({ client: secondClient })
+      await secondHooks.event({ event: { type: 'session.created', properties: { info: { id: 's1', agent: 'build' } } } })
+
+      assert.equal(secondCalls.length, 1, 'the once rule fires again after a simulated restart on V1')
+    } finally {
+      await cleanup()
+    }
+  })
+
   it('toolName fires on V1 via the real message.part.updated path', async () => {
     const { hooks, promptCalls, cleanup } = await loadV1([
       { id: 'r1', event: 'tool.execute.after', condition: { type: 'toolName', tool: 'bash' }, instruction: 'do X' },

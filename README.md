@@ -155,27 +155,43 @@ A rule with no `condition` (always-true) combined with `once: true` fires
 on the first matching event in the session and never again; combined with
 `edge: "rise"`, it fires only on the very first such event.
 
-### Known limitation: `once`/`edge` state does not survive a restart
+### Known limitation: `once`/`edge` state does not survive a restart (V1 only)
 
 `once`/`edge` modifier state (whether a rule has already fired, and its last
-resolved match/no-match) is tracked per rule ID in an in-memory `Map`, held
-inside the plugin process for the lifetime of that process (`sessionStates`
-in `plugin.v1.js`/`plugin.v2.js`, populated via `core.js`'s
-`createSessionState`/`evaluate`). It is **not** persisted anywhere.
+resolved match/no-match) is tracked per rule ID, per session, in an in-memory
+`Map` (`sessionStates` in `plugin.v1.js`/`plugin.v2.js`, populated via
+`core.js`'s `createSessionState`/`evaluate`).
 
-An opencode conversation session is file-backed and survives a service or
-plugin restart, but this modifier state does not: a restart resets every
-rule's tracked state to "never fired, no prior match" for every session,
-even one that has been running for hours. The next matching event after a
-restart is therefore indistinguishable from the *first* matching event in
-that session — an `edge: "rise"` rule can re-fire on what looks to it like a
-fresh false→true transition, and a `once: true` rule can fire again even
-though it already fired earlier in the same conversation.
+**On V2, this state is persisted to `ctx.storage`** — a durable, disk-backed
+key-value store scoped to this plugin — keyed per session, and hydrated back
+automatically the first time a session is touched by a new process. A `once`
+rule that already fired, or an `edge` rule's last resolved boolean, survives
+an opencode service restart. A rule set that uses no `once`/`edge` modifiers
+makes no storage calls at all. A stored value that cannot be read, or that
+can be read but does not match the expected shape, is treated as if no prior
+state exists — the plugin degrades to today's in-memory-only behavior rather
+than throwing or getting stuck.
+
+**On V1, this state remains in-memory-only** — V1 has no storage surface
+equivalent to `ctx.storage`, so a restart still resets every rule's tracked
+state to "never fired, no prior match" for every session on that runtime. The
+next matching event after a restart is indistinguishable from the *first*
+matching event in that session — an `edge: "rise"` rule can re-fire on what
+looks to it like a fresh false→true transition, and a `once: true` rule can
+fire again even though it already fired earlier in the same conversation.
+
+**Manual reset (V2).** Because state now survives a restart, editing a rule
+while keeping its `id`, or removing and later re-adding a rule under the same
+`id`, resurrects its prior `fired`/`lastMatch` value rather than starting
+fresh — restarting the service is no longer a way to reset a stuck rule. To
+force a clean slate for a rule, give it a new `id` (its recommended `event` +
+`condition` remain whatever they were); there is no separate reset command.
 
 **Prefer a stateless condition over `edge`/`once` whenever the intent can be
 expressed entirely from the current event's own data**, with no need to
 compare against a *previous* event. Such conditions have no cross-restart
-durability problem, because they hold no state to lose in the first place.
+durability problem — including on V1 — because they hold no state to lose in
+the first place.
 
 For example, "remind the agent right after it creates a todo list, but not
 on every later call" does not actually require detecting a 0→N transition.
@@ -202,8 +218,8 @@ unaffected by a mid-session restart.
 `edge`/`once` remain the right tool when the intent genuinely cannot be
 recovered from current data alone (e.g. "fire only the very first time this
 condition is ever true, even if it later becomes false and true again in a
-way indistinguishable from the data itself") — just budget for the
-restart-durability gap above when choosing them.
+way indistinguishable from the data itself") — just budget for the V1
+restart-durability gap above when choosing them on a V1 deployment.
 
 ### Migrating from the removed todo-derived condition types
 

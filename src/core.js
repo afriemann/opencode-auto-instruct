@@ -439,8 +439,7 @@ export function evaluate(rules, nev, agentName, sessionState, log, debug) {
     dbg(dbgDetail)
     if (!applicable) continue
 
-    const usesModifiers = (rule.once === true || rule.edge === 'rise' || rule.edge === 'fall')
-      && typeof rule.id === 'string'
+    const usesModifiers = ruleUsesModifiers(rule)
 
     let finalMatch = result
     let modifierUpdate = null
@@ -483,4 +482,66 @@ export function evaluate(rules, nev, agentName, sessionState, log, debug) {
 /** Creates a fresh per-session state object. */
 export function createSessionState() {
   return { modifierState: new Map() }
+}
+
+/**
+ * True when a rule declares a `once`/`edge` modifier with a stable `id` --
+ * the single predicate `evaluate()` and the V2 adapter's storage-gating
+ * logic both call, so the two can never drift apart (design.md D7).
+ *
+ * @param {any} rule
+ * @returns {boolean}
+ */
+export function ruleUsesModifiers(rule) {
+  return (rule.once === true || rule.edge === 'rise' || rule.edge === 'fall')
+    && typeof rule.id === 'string'
+}
+
+const MODIFIER_STATE_VERSION = 1
+
+/**
+ * Serializes a session's modifier state into a plain, JSON-safe,
+ * prototype-pollution-safe snapshot suitable for durable storage
+ * (design.md D3/D4). Deep-copies every entry -- the returned object never
+ * aliases the live Map that `evaluate()` mutates in place.
+ *
+ * @param {{ modifierState: Map<string, {lastMatch: boolean, fired: boolean}> }} sessionState
+ * @returns {{ v: number, rules: Record<string, {lastMatch: boolean, fired: boolean}>, updatedAt: number }}
+ */
+export function serializeModifierState(sessionState) {
+  const rules = Object.create(null)
+  for (const [ruleId, state] of sessionState.modifierState) {
+    rules[ruleId] = { lastMatch: state.lastMatch === true, fired: state.fired === true }
+  }
+  return { v: MODIFIER_STATE_VERSION, rules, updatedAt: Date.now() }
+}
+
+/**
+ * Total, non-throwing inverse of `serializeModifierState`. Every input --
+ * including a malformed-but-successfully-read stored payload -- maps to a
+ * valid `SessionState`, never throws, and never lets a bad entry discard
+ * its valid siblings (design.md D2). A payload that fails validation at
+ * any level is treated as "no prior state exists" and yields a fresh
+ * `createSessionState()`.
+ *
+ * @param {any} payload
+ * @returns {{ modifierState: Map<string, {lastMatch: boolean, fired: boolean}> }}
+ */
+export function hydrateSessionState(payload) {
+  if (payload === null || typeof payload !== 'object' || Array.isArray(payload)) {
+    return createSessionState()
+  }
+  if (payload.v !== MODIFIER_STATE_VERSION) return createSessionState()
+
+  const rules = payload.rules
+  if (rules === null || typeof rules !== 'object' || Array.isArray(rules)) {
+    return createSessionState()
+  }
+
+  const modifierState = new Map()
+  for (const [ruleId, entry] of Object.entries(rules)) {
+    if (entry === null || typeof entry !== 'object' || Array.isArray(entry)) continue
+    modifierState.set(ruleId, { lastMatch: entry.lastMatch === true, fired: entry.fired === true })
+  }
+  return { modifierState }
 }
