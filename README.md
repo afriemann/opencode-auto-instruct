@@ -155,6 +155,56 @@ A rule with no `condition` (always-true) combined with `once: true` fires
 on the first matching event in the session and never again; combined with
 `edge: "rise"`, it fires only on the very first such event.
 
+### Known limitation: `once`/`edge` state does not survive a restart
+
+`once`/`edge` modifier state (whether a rule has already fired, and its last
+resolved match/no-match) is tracked per rule ID in an in-memory `Map`, held
+inside the plugin process for the lifetime of that process (`sessionStates`
+in `plugin.v1.js`/`plugin.v2.js`, populated via `core.js`'s
+`createSessionState`/`evaluate`). It is **not** persisted anywhere.
+
+An opencode conversation session is file-backed and survives a service or
+plugin restart, but this modifier state does not: a restart resets every
+rule's tracked state to "never fired, no prior match" for every session,
+even one that has been running for hours. The next matching event after a
+restart is therefore indistinguishable from the *first* matching event in
+that session — an `edge: "rise"` rule can re-fire on what looks to it like a
+fresh false→true transition, and a `once: true` rule can fire again even
+though it already fired earlier in the same conversation.
+
+**Prefer a stateless condition over `edge`/`once` whenever the intent can be
+expressed entirely from the current event's own data**, with no need to
+compare against a *previous* event. Such conditions have no cross-restart
+durability problem, because they hold no state to lose in the first place.
+
+For example, "remind the agent right after it creates a todo list, but not
+on every later call" does not actually require detecting a 0→N transition.
+A freshly created list has every item still `pending` — nothing has been
+started yet — so the same intent can be expressed as a condition that only
+inspects the current call's data:
+
+```json
+{
+  "id": "todo-list-created",
+  "event": "tool.execute.after",
+  "condition": { "type": "dataArrayAllMatch", "path": "todos", "field": "status", "value": "pending", "tool": "todowrite" },
+  "instruction": "You have just created a todo list. Keep it accurate as you work: mark items `in_progress` before starting, `completed` immediately after finishing, and add newly-discovered follow-ups. Only one item should be `in_progress` at a time."
+}
+```
+
+This fires only while every todo is still `pending` (i.e. before the agent
+starts the first item) and stops matching the moment any item moves to
+`in_progress` or `completed` — the same effective behavior as
+`dataArrayNonEmpty` + `edge: "rise"`, but derived solely from the data in
+each event rather than a transition tracked across events, so it is
+unaffected by a mid-session restart.
+
+`edge`/`once` remain the right tool when the intent genuinely cannot be
+recovered from current data alone (e.g. "fire only the very first time this
+condition is ever true, even if it later becomes false and true again in a
+way indistinguishable from the data itself") — just budget for the
+restart-durability gap above when choosing them.
+
 ### Migrating from the removed todo-derived condition types
 
 The condition types `allTodosComplete`, `anyTodosComplete`,
