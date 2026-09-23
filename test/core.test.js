@@ -19,6 +19,9 @@ import {
   resolveConfigPath,
   REMOVED_LEGACY_CONDITION_TYPES,
   REMOVED_LEGACY_EVENT_TYPES,
+  ruleUsesModifiers,
+  serializeModifierState,
+  hydrateSessionState,
 } from '../src/core.js'
 
 function makeLog() {
@@ -564,5 +567,158 @@ describe('evaluate', () => {
     const nev = { kind: 'tool.execute.after', sessionID: 's1', toolName: 'todowrite', toolMetadata: {} }
     const decisions = evaluate(rules, nev, 'build', state, makeLog(), false)
     assert.deepEqual(decisions.map(d => d.rule.id).sort(), ['ra'])
+  })
+})
+
+describe('ruleUsesModifiers', () => {
+  it('is false for a rule with no once/edge modifier', () => {
+    assert.equal(ruleUsesModifiers({ id: 'r1', event: 'x' }), false)
+  })
+
+  it('is true for once: true with a stable id', () => {
+    assert.equal(ruleUsesModifiers({ id: 'r1', once: true }), true)
+  })
+
+  it('is true for edge: rise with a stable id', () => {
+    assert.equal(ruleUsesModifiers({ id: 'r1', edge: 'rise' }), true)
+  })
+
+  it('is true for edge: fall with a stable id', () => {
+    assert.equal(ruleUsesModifiers({ id: 'r1', edge: 'fall' }), true)
+  })
+
+  it('is false for once: true without an id', () => {
+    assert.equal(ruleUsesModifiers({ once: true }), false)
+  })
+
+  it('is false for edge: rise without an id', () => {
+    assert.equal(ruleUsesModifiers({ edge: 'rise' }), false)
+  })
+
+  it('is false for an unrecognized edge value', () => {
+    assert.equal(ruleUsesModifiers({ id: 'r1', edge: 'sideways' }), false)
+  })
+})
+
+describe('serializeModifierState', () => {
+  it('serializes an empty state to an empty rules bag under version 1', () => {
+    const snapshot = serializeModifierState(createSessionState())
+    assert.equal(snapshot.v, 1)
+    assert.deepEqual({ ...snapshot.rules }, {})
+    assert.equal(typeof snapshot.updatedAt, 'number')
+  })
+
+  it('serializes populated modifier state for every rule id', () => {
+    const state = createSessionState()
+    state.modifierState.set('r1', { lastMatch: true, fired: false })
+    state.modifierState.set('r2', { lastMatch: false, fired: true })
+    const snapshot = serializeModifierState(state)
+    assert.deepEqual({ ...snapshot.rules }, {
+      r1: { lastMatch: true, fired: false },
+      r2: { lastMatch: false, fired: true },
+    })
+  })
+
+  it('produces a rules bag with a null prototype (prototype-pollution guard)', () => {
+    const snapshot = serializeModifierState(createSessionState())
+    assert.equal(Object.getPrototypeOf(snapshot.rules), null)
+  })
+
+  it('deep-copies entries: mutating the source state after serializing does not change the snapshot', () => {
+    const state = createSessionState()
+    state.modifierState.set('r1', { lastMatch: true, fired: false })
+    const snapshot = serializeModifierState(state)
+    state.modifierState.get('r1').lastMatch = false
+    assert.equal(snapshot.rules.r1.lastMatch, true)
+  })
+})
+
+describe('hydrateSessionState', () => {
+  it('returns a fresh state for undefined', () => {
+    const state = hydrateSessionState(undefined)
+    assert.equal(state.modifierState.size, 0)
+  })
+
+  it('returns a fresh state for null', () => {
+    const state = hydrateSessionState(null)
+    assert.equal(state.modifierState.size, 0)
+  })
+
+  it('returns a fresh state for a non-object primitive', () => {
+    const state = hydrateSessionState(42)
+    assert.equal(state.modifierState.size, 0)
+  })
+
+  it('returns a fresh state for an array payload', () => {
+    const state = hydrateSessionState([])
+    assert.equal(state.modifierState.size, 0)
+  })
+
+  it('returns a fresh state for a string payload', () => {
+    const state = hydrateSessionState('{')
+    assert.equal(state.modifierState.size, 0)
+  })
+
+  it('returns a fresh state for an unrecognized version', () => {
+    const state = hydrateSessionState({ v: 2, rules: { r1: { lastMatch: true, fired: false } } })
+    assert.equal(state.modifierState.size, 0)
+  })
+
+  it('returns a fresh state when rules is not an object', () => {
+    const state = hydrateSessionState({ v: 1, rules: 'not-an-object' })
+    assert.equal(state.modifierState.size, 0)
+  })
+
+  it('returns a fresh state when rules is an array', () => {
+    const state = hydrateSessionState({ v: 1, rules: [] })
+    assert.equal(state.modifierState.size, 0)
+  })
+
+  it('drops a malformed per-rule entry without throwing, keeping valid siblings', () => {
+    const state = hydrateSessionState({
+      v: 1,
+      rules: {
+        good: { lastMatch: true, fired: false },
+        bad: 'not-an-object',
+      },
+    })
+    assert.equal(state.modifierState.has('bad'), false)
+    assert.deepEqual(state.modifierState.get('good'), { lastMatch: true, fired: false })
+  })
+
+  it('coerces non-boolean lastMatch/fired values to false rather than throwing', () => {
+    const state = hydrateSessionState({
+      v: 1,
+      rules: { r1: { lastMatch: 'yes', fired: 1 } },
+    })
+    assert.deepEqual(state.modifierState.get('r1'), { lastMatch: false, fired: false })
+  })
+
+  it('does not pollute Object.prototype via a __proto__ rule id', () => {
+    const payload = JSON.parse('{"v":1,"rules":{"__proto__":{"lastMatch":true,"fired":true}}}')
+    hydrateSessionState(payload)
+    assert.equal(({}).polluted, undefined)
+  })
+
+  it('hydrates a well-formed payload into a Map of the expected shape', () => {
+    const state = hydrateSessionState({
+      v: 1,
+      rules: { r1: { lastMatch: true, fired: false }, r2: { lastMatch: false, fired: true } },
+    })
+    assert.ok(state.modifierState instanceof Map)
+    assert.deepEqual(state.modifierState.get('r1'), { lastMatch: true, fired: false })
+    assert.deepEqual(state.modifierState.get('r2'), { lastMatch: false, fired: true })
+  })
+})
+
+describe('serializeModifierState / hydrateSessionState round-trip', () => {
+  it('reproduces identical lastMatch/fired values for every rule id', () => {
+    const state = createSessionState()
+    state.modifierState.set('r1', { lastMatch: true, fired: false })
+    state.modifierState.set('r2', { lastMatch: false, fired: true })
+    const rehydrated = hydrateSessionState(serializeModifierState(state))
+    assert.deepEqual(rehydrated.modifierState.get('r1'), { lastMatch: true, fired: false })
+    assert.deepEqual(rehydrated.modifierState.get('r2'), { lastMatch: false, fired: true })
+    assert.equal(rehydrated.modifierState.size, 2)
   })
 })

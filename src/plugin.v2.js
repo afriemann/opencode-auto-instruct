@@ -41,9 +41,13 @@ import {
   evaluate,
   buildFraming,
   validateRules,
+  ruleUsesModifiers,
+  serializeModifierState,
+  hydrateSessionState,
 } from './core.js'
 
 const PLUGIN_NAME = 'opencode-auto-instruct'
+const MODIFIER_STATE_KEY_PREFIX = 'modifierState:'
 
 /** Returns a logger function; V2's Context.app has no log method, so this is stderr-only. */
 function makeLogger() {
@@ -135,13 +139,126 @@ export default Plugin.define({
     validateRules(rules, log)
 
     const sessionAgents = new Map()
+    /** sessionID -> Promise<SessionState> (single-flight hydration, design.md D1) */
     const sessionStates = new Map()
     /** sessionID -> Set of rule ids already logged as having switched the agent persistently */
     const switchAgentLoggedFor = new Map()
 
-    function getSessionState(sessionID) {
-      if (!sessionStates.has(sessionID)) sessionStates.set(sessionID, createSessionState())
-      return sessionStates.get(sessionID)
+    /** sessionID -> Promise<void>, a per-session serialized write queue (design.md D8) */
+    const writeChains = new Map()
+    /** sessionID -> last-persisted `rules` JSON string, for the dirty-check (design.md D5) */
+    const lastPersisted = new Map()
+
+    // Precomputed once at load time (design.md D6/D7): the set of event
+    // kinds for which at least one loaded rule uses a once/edge modifier.
+    // A rule set with none makes zero storage calls, ever.
+    const modifierEventKinds = new Set(
+      rules.filter(ruleUsesModifiers).map((rule) => rule.event),
+    )
+
+    // Whether ctx.storage is present at all (design.md D13). Cheap
+    // insurance: ctx.storage is confirmed present at the pinned floor
+    // version, but a reduced host context must not crash the plugin --
+    // it must simply behave exactly as it did before this change. Only
+    // warn when it would actually matter -- a rule set with no
+    // once/edge modifiers never touches storage either way.
+    const storageAvailable = Boolean(ctx.storage?.get)
+    if (!storageAvailable && modifierEventKinds.size > 0) {
+      log('ctx.storage is not available on this host -- modifier state will not survive a restart', null, 'warn')
+    }
+
+    function storageKeyFor(sessionID) {
+      return MODIFIER_STATE_KEY_PREFIX + sessionID
+    }
+
+    async function hydrateFromStorage(sessionID) {
+      try {
+        const payload = await ctx.storage.get(storageKeyFor(sessionID))
+        const state = hydrateSessionState(payload)
+        if (debug && state.modifierState.size > 0) {
+          const summary = [...state.modifierState.entries()]
+            .map(([id, s]) => `${id}=${JSON.stringify(s)}`).join(', ')
+          log(`[debug] hydrated session=${sessionID} modifier state: ${summary}`)
+        }
+        // Seed the dirty-check baseline from what was actually read, so a
+        // restarted session that evaluates without any change writes
+        // nothing (design.md D5 seeding).
+        if (payload !== undefined) {
+          lastPersisted.set(sessionID, JSON.stringify(serializeModifierState(state).rules))
+        }
+        return state
+      } catch (err) {
+        // Fail-open (design.md D9): any storage error is treated as no
+        // prior state, never thrown, never fatal to event processing.
+        log(`failed to hydrate modifier state for session=${sessionID}`, err, 'warn')
+        return createSessionState()
+      }
+    }
+
+    /**
+     * @param {string} sessionID
+     * @param {{ gated: boolean }} opts `gated` is true when this event's
+     *   kind is one at least one modifier rule cares about (design.md D6).
+     * @returns {Promise<SessionState>}
+     */
+    function getSessionState(sessionID, { gated }) {
+      const cached = sessionStates.get(sessionID)
+      if (cached) return cached
+
+      if (!gated) {
+        // No rule cares about this event kind at all: transient, uncached
+        // (design.md D6) -- evaluate() cannot touch modifierState for it.
+        return Promise.resolve(createSessionState())
+      }
+
+      if (!storageAvailable) {
+        // Gated, but no durable storage on this host: fall back to the
+        // pre-change in-memory-only behavior exactly -- cache a fresh
+        // state so once/edge semantics still hold *within this process*
+        // (design.md D13). Returning a transient state here would silently
+        // break once/edge on every event, not just across a restart.
+        const state = Promise.resolve(createSessionState())
+        sessionStates.set(sessionID, state)
+        return state
+      }
+
+      const promise = hydrateFromStorage(sessionID)
+      // Inserted synchronously, before any await settles -- a second
+      // concurrent caller finds this same promise rather than starting
+      // its own hydration (design.md D1, single-flight).
+      sessionStates.set(sessionID, promise)
+      return promise
+    }
+
+    function enqueueWrite(sessionID, task) {
+      const previous = writeChains.get(sessionID) ?? Promise.resolve()
+      const next = previous.then(task).catch((err) => {
+        log(`modifier state write failed for session=${sessionID}`, err, 'warn')
+      })
+      writeChains.set(sessionID, next)
+      return next
+    }
+
+    function persistIfDirty(sessionID, sessionState) {
+      if (!storageAvailable) return
+      // Serialize synchronously, at the commit point -- not inside the
+      // queued write -- so a later event's mutation of the live Map can
+      // never be captured by an earlier event's write (design.md D3).
+      const snapshot = serializeModifierState(sessionState)
+      const rulesJson = JSON.stringify(snapshot.rules)
+      if (lastPersisted.get(sessionID) === rulesJson) return
+      lastPersisted.set(sessionID, rulesJson)
+      // Not awaited here -- enqueued and the handler returns immediately,
+      // so disk I/O never sits on the hot tool-hook path (design.md D8).
+      enqueueWrite(sessionID, () => ctx.storage.set(storageKeyFor(sessionID), snapshot))
+    }
+
+    function forgetSession(sessionID) {
+      sessionStates.delete(sessionID)
+      writeChains.delete(sessionID)
+      lastPersisted.delete(sessionID)
+      sessionAgents.delete(sessionID)
+      switchAgentLoggedFor.delete(sessionID)
     }
 
     async function resolveAgent(sessionID) {
@@ -167,8 +284,15 @@ export default Plugin.define({
       if (nev.agentHint) sessionAgents.set(nev.sessionID, nev.agentHint)
 
       const agentName = await resolveAgent(nev.sessionID)
-      const sessionState = getSessionState(nev.sessionID)
+      const gated = modifierEventKinds.has(nev.kind)
+      const sessionState = await getSessionState(nev.sessionID, { gated })
       const decisions = evaluate(rules, nev, agentName, sessionState, log, debug)
+
+      // Persist at the commit point -- evaluate() is where modifier state
+      // changes; the delivery loop below is a long await chain during
+      // which a crash would otherwise lose an already-committed update
+      // (design.md D8 placement).
+      if (gated) persistIfDirty(nev.sessionID, sessionState)
 
       for (const { rule, agentName: resolvedAgentName } of decisions) {
         try {
@@ -240,6 +364,20 @@ export default Plugin.define({
       try {
         for await (const event of ctx.event.subscribe({ signal: abortController.signal })) {
           try {
+            if (event.type === 'session.deleted') {
+              const sessionID = event.data?.sessionID
+              if (sessionID) {
+                // Ordered on the same per-session write chain as regular
+                // persists -- a removal racing an in-flight write could
+                // otherwise be overtaken and resurrect the entry
+                // (design.md D11).
+                if (storageAvailable) {
+                  await enqueueWrite(sessionID, () => ctx.storage.remove(storageKeyFor(sessionID)))
+                }
+                forgetSession(sessionID)
+              }
+              continue
+            }
             await handleNormalizedEvent(normalize(event))
           } catch (err) {
             // One malformed event must not kill the subscription loop.
