@@ -34,4 +34,4 @@
 
 - [x] 6.1 Self-review the diff for duplication, code smells, overengineering, and redundant comments per the `refactor` checklist; document any accepted findings.
 - [x] 6.2 Get the change reviewed by `code-reviewer` (proposal → specs → diff); resolve every `[BLOCKER]`; explicitly accept or reject every `[WARNING]` with a stated reason.
-- [ ] 6.3 Commit, run `openspec archive persist-modifier-state-ctx-storage --yes`, commit the archival, push the branch, and open a PR.
+- [x] 6.3 Commit, run `openspec archive persist-modifier-state-ctx-storage --yes`, commit the archival, push the branch, and open a PR.

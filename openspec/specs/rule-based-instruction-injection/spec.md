@@ -163,6 +163,9 @@ condition is honoured:
   fire on the first matching event of the rule's configured kind in the
   session and never again. Combined with `edge: "rise"`, such a rule SHALL
   fire only on the very first event of that kind in the session.
+- Whether this per-rule `once`/`edge` state survives an opencode service
+  restart within the same session is runtime-dependent and is defined by
+  the "Modifier State Durability" requirement, not by this one.
 
 **Load-time validation.** At load time, the plugin SHALL log one warning
 for each of: an unrecognized condition type; a missing or invalid `path` on
@@ -478,3 +481,95 @@ any specific agent filter, passes no filter).
   the event's own `properties.sessionID` is absent)
 - WHEN the plugin processes the event
 - THEN rule evaluation proceeds using `part.sessionID`
+
+### Requirement: Modifier State Durability
+
+On the V2 runtime, a rule's `once`/`edge` state (as defined by the
+"Condition Evaluation" requirement) SHALL survive an opencode service
+restart within the same conversation session: the plugin SHALL persist
+each session's modifier state to durable storage, and SHALL hydrate it
+back into memory the first time that session is touched by a new process.
+On the V1 runtime, this durability guarantee SHALL NOT apply — V1 has no
+durable per-plugin storage surface, and modifier state SHALL remain
+in-memory-only, reset on every process restart, exactly as it behaves
+today.
+
+Hydration on V2 SHALL be single-flight per session: when two events for
+the same session arrive concurrently before hydration completes, the
+plugin SHALL perform exactly one read of durable storage for that session,
+and both events SHALL evaluate against the same resulting state — neither
+SHALL trigger a second, independent hydration that could overwrite the
+other's subsequent update.
+
+A stored payload that cannot be read (a storage error) or that can be
+read but does not match the persisted state's expected shape (e.g. it is
+not an object, carries an unrecognized version marker, or contains
+malformed per-rule entries) SHALL be treated as if no prior state exists
+for that session. Neither case SHALL cause event processing to fail, and
+neither SHALL leave the session unable to process future events.
+
+On V2, when a session is deleted, the plugin SHALL remove that session's
+persisted modifier state from durable storage.
+
+#### Scenario: V2 once-rule state survives a restart
+
+- GIVEN a V2 session in which a rule with `id: "r1"` and `once: true` has
+  already fired once
+- WHEN the opencode service restarts and a subsequent event in the same
+  session again satisfies that rule's condition
+- THEN the rule does not fire again
+
+#### Scenario: V2 edge-rise rule state survives a restart
+
+- GIVEN a V2 session in which a rule with `id: "r2"` and `edge: "rise"` has
+  a stored prior boolean of `true` (matching)
+- WHEN the opencode service restarts and a subsequent event's condition
+  again evaluates to matching
+- THEN the rule does not re-fire, since no false-to-true transition has
+  occurred relative to the restored prior state
+
+#### Scenario: Unreadable stored state is treated as no prior state
+
+- GIVEN a V2 session whose persisted modifier state cannot be read from
+  durable storage
+- WHEN an event for that session is processed
+- THEN the plugin proceeds as if no prior state exists for that session,
+  and the event is evaluated and any matching rules are delivered normally
+
+#### Scenario: Malformed but readable stored state is treated as no prior state
+
+- GIVEN a V2 session whose persisted modifier state was read successfully
+  but does not match the expected shape (for example, it is not an
+  object, or a stored per-rule entry has unexpected value types)
+- WHEN an event for that session is processed
+- THEN the plugin proceeds as if no prior state exists for that session,
+  and this and all subsequent events for that session continue to be
+  evaluated and delivered normally
+
+#### Scenario: V1 modifier state does not survive a restart
+
+- GIVEN a V1 session in which a rule with `once: true` has already fired
+  once
+- WHEN the opencode service restarts and a subsequent event in the same
+  session again satisfies that rule's condition
+- THEN the rule fires again, since V1 modifier state is in-memory-only
+
+#### Scenario: Concurrent events for one session hydrate exactly once
+
+- GIVEN a V2 session with no modifier state yet loaded into memory for the
+  current process
+- WHEN two events for that session are processed concurrently before
+  hydration completes
+- THEN durable storage is read exactly once for that session, and both
+  events' rule evaluations observe the same hydrated state with no lost
+  update between them
+
+#### Scenario: A restarted session's persistently switched agent is not redundantly re-switched
+
+- GIVEN a V2 session in which a `once: true` rule with `switchToAgent` has
+  already fired and persistently switched the session to a different
+  agent
+- WHEN the opencode service restarts and a subsequent event again
+  satisfies that rule's condition
+- THEN the rule does not fire again, and the plugin does not call
+  `ctx.session.switchAgent` a second time for that session
