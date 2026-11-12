@@ -25,7 +25,7 @@
     "@opencode/plugin": { "optional": true }
   },
   "devDependencies": {
-    "@opencode/cli": "^2.2.5",
+    "@opencode/cli": "^2.2.6",
     "@opencode/plugin": "^2.2.6"
   }
 }
