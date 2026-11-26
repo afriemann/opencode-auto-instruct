@@ -26,6 +26,6 @@
   },
   "devDependencies": {
     "@opencode/cli": "^2.3.0",
-    "@opencode/plugin": "^2.3.0"
+    "@opencode/plugin": "^2.4.1"
   }
 }
